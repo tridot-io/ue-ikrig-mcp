@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ue-ikrig-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "MCP server for creating and fine-tuning IK Rigs and IK Retargeters in Unreal Engine 5"
 requires-python = ">=3.10"
 dependencies = ["mcp>=1.0.0"]
