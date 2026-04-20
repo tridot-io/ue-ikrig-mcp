@@ -5,7 +5,7 @@ from mcp.server.fastmcp import FastMCP
 server = FastMCP("ue-ikrig")
 
 # Import and register tools from each module
-from .tools import connection, ik_rig, retargeter, fine_tuning, batch, capture, retargeter_advanced, ergonomics
+from .tools import connection, ik_rig, retargeter, fine_tuning, batch, capture, retargeter_advanced, ergonomics, validation
 
 
 def register_all_tools():
@@ -17,6 +17,7 @@ def register_all_tools():
     capture.register(server)
     retargeter_advanced.register(server)
     ergonomics.register(server)
+    validation.register(server)
 
 
 def main():

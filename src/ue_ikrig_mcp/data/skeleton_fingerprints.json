@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "conventions": [
+    {
+      "name": "metahuman",
+      "description": "MetaHuman skeleton (UE 5). Distinctive: twist chains (upperarm_twist_*, calf_twist_*), finger metacarpals, 5 spine vertebrae.",
+      "required_bones": ["pelvis", "spine_01", "spine_04", "spine_05", "clavicle_l", "upperarm_l", "lowerarm_l", "hand_l", "thigh_l", "calf_l", "foot_l", "ball_l", "head", "neck_01"],
+      "distinctive_bones": ["upperarm_twist_01_l", "upperarm_twist_02_l", "lowerarm_twist_01_l", "lowerarm_twist_02_l", "thigh_twist_01_l", "calf_twist_01_l", "index_metacarpal_l", "middle_metacarpal_l", "ring_metacarpal_l", "pinky_metacarpal_l", "spine_04", "spine_05"],
+      "suggested_preset": "mixamo_to_metahuman_female_tall"
+    },
+    {
+      "name": "ue5_mannequin",
+      "description": "UE5 Mannequin (SK_Mannequin with MetaHuman skeleton but no metacarpals and fewer spine bones). Distinctive: has twist chains but no metacarpals.",
+      "required_bones": ["pelvis", "spine_01", "spine_02", "spine_03", "clavicle_l", "upperarm_l", "lowerarm_l", "hand_l", "thigh_l", "calf_l", "foot_l", "ball_l", "head", "neck_01"],
+      "distinctive_bones": ["upperarm_twist_01_l", "thigh_twist_01_l", "index_01_l"],
+      "negative_bones": ["index_metacarpal_l", "spine_04", "spine_05"],
+      "suggested_preset": "ue5_mannequin_to_metahuman"
+    },
+    {
+      "name": "ue4_mannequin",
+      "description": "UE4 Mannequin (classic). No twist bones, 3-bone spine, simple finger chains.",
+      "required_bones": ["pelvis", "spine_01", "spine_02", "spine_03", "clavicle_l", "upperarm_l", "lowerarm_l", "hand_l", "thigh_l", "calf_l", "foot_l", "ball_l", "head", "neck_01", "index_01_l"],
+      "distinctive_bones": ["index_01_l", "middle_01_l", "ring_01_l", "pinky_01_l", "thumb_01_l"],
+      "negative_bones": ["upperarm_twist_01_l", "lowerarm_twist_01_l", "thigh_twist_01_l", "index_metacarpal_l", "spine_04", "spine_05"],
+      "suggested_preset": "ue4_mannequin_to_metahuman"
+    },
+    {
+      "name": "mixamo",
+      "description": "Mixamo auto-rigged skeleton (Adobe). Distinctive: Hips root, Left/Right-prefixed bone names with mixed case, finger chains with HandThumb/Index/Middle/Ring/Pinky pattern.",
+      "required_bones": ["Hips", "Spine", "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase", "LeftArm", "LeftForeArm", "LeftHand", "LeftShoulder", "Neck", "Head"],
+      "distinctive_bones": ["LeftHandThumb1", "LeftHandIndex1", "LeftHandMiddle1", "LeftHandRing1", "LeftHandPinky1", "LeftToeBase", "Spine1", "Spine2"],
+      "negative_bones": ["pelvis", "spine_01", "upperarm_l"],
+      "suggested_preset": "mixamo_to_metahuman_female_tall"
+    },
+    {
+      "name": "mixamo_fbx_prefixed",
+      "description": "Mixamo with the mixamorig: prefix Maya/FBX often adds to each bone name.",
+      "required_bones": ["mixamorig:Hips", "mixamorig:Spine", "mixamorig:LeftUpLeg", "mixamorig:LeftArm", "mixamorig:Head"],
+      "distinctive_bones": ["mixamorig:LeftHandThumb1", "mixamorig:LeftToeBase"],
+      "suggested_preset": "mixamo_to_metahuman_female_tall"
+    },
+    {
+      "name": "daz_genesis",
+      "description": "Daz Studio Genesis 8/9 character (distinctive hip, lCollar, lShldr / rShldr prefix pattern).",
+      "required_bones": ["hip", "abdomen", "chest", "neck", "head", "lCollar", "lShldr", "lForearm", "lHand", "lThigh", "lShin", "lFoot"],
+      "distinctive_bones": ["abdomen2", "chestUpper", "lPectoral", "lHandPinky1"],
+      "suggested_preset": null
+    }
+  ]
+}
