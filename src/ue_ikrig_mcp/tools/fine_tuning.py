@@ -392,3 +392,128 @@ def register(server):
         )
         result = conn.execute(script)
         return _ok(result)
+
+    @server.tool(
+        name="auto_align_mapped_bones",
+        description=(
+            "Crash-safe auto-align that only touches bones in currently-mapped retarget chains. "
+            "UE 5.6's auto_align_all_bones asserts and crashes the editor if any chain on the "
+            "iterated side lacks a source mapping (e.g. MetaHuman twist / metacarpal chains on a "
+            "Mixamo-sourced retargeter). This tool walks the mapped chains, collects every bone "
+            "between each chain's start_bone and end_bone, and calls auto_align_bones on just "
+            "that curated list. Returns per-bone before/after euler offsets in degrees. "
+            "method: 'ChainToChain' | 'LocalRotationAxes' | 'GlobalRotationAxes' | 'MeshToMesh'. "
+            "source_or_target: 'Source' | 'Target' (default 'Target')."
+        ),
+    )
+    async def auto_align_mapped_bones(
+        retargeter_path: str,
+        method: str = "ChainToChain",
+        source_or_target: str = "Target",
+    ) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+
+        _method_map = {
+            "chaintochain": "CHAIN_TO_CHAIN",
+            "chain_to_chain": "CHAIN_TO_CHAIN",
+            "localrotationaxes": "LOCAL_ROTATION_AXES",
+            "local_rotation_axes": "LOCAL_ROTATION_AXES",
+            "globalrotationaxes": "GLOBAL_ROTATION_AXES",
+            "global_rotation_axes": "GLOBAL_ROTATION_AXES",
+            "meshtomesh": "MESH_TO_MESH",
+            "mesh_to_mesh": "MESH_TO_MESH",
+        }
+        method_key = _method_map.get(method.lower().replace(" ", ""))
+        if method_key is None:
+            return _err(f"Unknown method: {method!r}. Use ChainToChain, LocalRotationAxes, GlobalRotationAxes, or MeshToMesh.")
+
+        side = "TARGET" if source_or_target.lower() == "target" else "SOURCE"
+
+        rtp = escape_string(retargeter_path)
+        script = wrap_script(
+            "import unreal\n"
+            f'rtg = unreal.load_asset("{rtp}")\n'
+            "if rtg is None:\n"
+            f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
+            "ctrl = unreal.IKRetargeterController.get_controller(rtg)\n"
+            f"sot = unreal.RetargetSourceOrTarget.{side}\n"
+            "side_rig = ctrl.get_ik_rig(sot)\n"
+            "if side_rig is None:\n"
+            f'    raise ValueError("{side} IKRig not assigned on retargeter")\n'
+            "side_ctrl = unreal.IKRigController.get_controller(side_rig)\n"
+            "side_mesh = side_ctrl.get_skeletal_mesh()\n"
+            "side_skel = side_mesh.skeleton if side_mesh else None\n"
+            "if side_skel is None:\n"
+            '    raise ValueError("Skeleton not available for selected side")\n'
+            "# Figure out which target chains are mapped to a source chain\n"
+            "chains = side_ctrl.get_retarget_chains()\n"
+            "mapped_target_chains = []\n"
+            "for ch in chains:\n"
+            "    t_name = str(ch.chain_name)\n"
+            "    if sot == unreal.RetargetSourceOrTarget.TARGET:\n"
+            "        src_chain = str(ctrl.get_source_chain(t_name))\n"
+            "        if src_chain and src_chain != 'None':\n"
+            "            mapped_target_chains.append(ch)\n"
+            "    else:\n"
+            "        # For source side: include every chain; there's no per-source unmapped concept\n"
+            "        mapped_target_chains.append(ch)\n"
+            "# Enumerate bones between start_bone and end_bone (walk parents)\n"
+            "def _bn(br):\n"
+            "    return str(br.get_editor_property('bone_name')) if br is not None else ''\n"
+            "def _collect(ch_obj):\n"
+            "    sb = _bn(ch_obj.get_editor_property('start_bone'))\n"
+            "    eb = _bn(ch_obj.get_editor_property('end_bone'))\n"
+            "    if not sb:\n"
+            "        return []\n"
+            "    if sb == eb:\n"
+            "        return [sb]\n"
+            "    out, cursor = [], eb\n"
+            "    for _ in range(512):\n"
+            "        out.append(cursor)\n"
+            "        if cursor == sb:\n"
+            "            break\n"
+            "        ref = side_skel.get_reference_skeleton() if hasattr(side_skel, 'get_reference_skeleton') else None\n"
+            "        if ref is not None:\n"
+            "            parent_idx = ref.get_parent_index(ref.get_bone_index(cursor))\n"
+            "            if parent_idx == -1:\n"
+            "                break\n"
+            "            cursor = str(ref.get_bone_name(parent_idx))\n"
+            "        else:\n"
+            "            # Fallback: walk by find/get on USkeleton directly\n"
+            "            idx = side_skel.find_bone_index(cursor) if hasattr(side_skel, 'find_bone_index') else -1\n"
+            "            if idx == -1:\n"
+            "                break\n"
+            "            parent_idx = side_skel.get_parent_index(idx) if hasattr(side_skel, 'get_parent_index') else -1\n"
+            "            if parent_idx == -1:\n"
+            "                break\n"
+            "            cursor = str(side_skel.get_bone_name(parent_idx))\n"
+            "    out.reverse()\n"
+            "    return out\n"
+            "bones_set = set()\n"
+            "for ch in mapped_target_chains:\n"
+            "    for b in _collect(ch):\n"
+            "        if b:\n"
+            "            bones_set.add(b)\n"
+            "bones = sorted(bones_set)\n"
+            "def _to_deg(q):\n"
+            "    r = q.rotator()\n"
+            "    return [round(r.roll, 3), round(r.pitch, 3), round(r.yaw, 3)]\n"
+            "before = {b: _to_deg(ctrl.get_rotation_offset_for_retarget_pose_bone(b, sot)) for b in bones}\n"
+            f"ctrl.auto_align_bones(bones, unreal.RetargetAutoAlignMethod.{method_key}, sot)\n"
+            "after = {b: _to_deg(ctrl.get_rotation_offset_for_retarget_pose_bone(b, sot)) for b in bones}\n"
+            "changed = [b for b in bones if before[b] != after[b]]\n"
+            "print('__MCP_RESULT__' + json.dumps({\n"
+            "    'side': '" + side + "',\n"
+            f"    'method': '{method_key}',\n"
+            "    'mapped_chain_count': len(mapped_target_chains),\n"
+            "    'bone_count': len(bones),\n"
+            "    'changed_count': len(changed),\n"
+            "    'before': before,\n"
+            "    'after': after,\n"
+            "}))"
+        )
+        result = conn.execute(script)
+        return _ok(result)
