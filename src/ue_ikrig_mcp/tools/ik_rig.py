@@ -87,11 +87,13 @@ def register(server):
             "root_bone = controller.get_retarget_root()\n"
             "chains = []\n"
             "for chain in controller.get_retarget_chains():\n"
+            "    _sb = chain.get_editor_property('start_bone')\n"
+            "    _eb = chain.get_editor_property('end_bone')\n"
             "    chains.append({\n"
             '        "chain_name": str(chain.chain_name),\n'
-            '        "start_bone": str(chain.start_bone),\n'
-            '        "end_bone": str(chain.end_bone),\n'
-            '        "goal": str(chain.goal_name) if chain.goal_name else ""\n'
+            '        "start_bone": str(_sb.bone_name) if _sb else "",\n'
+            '        "end_bone": str(_eb.bone_name) if _eb else "",\n'
+            '        "goal": str(chain.ik_goal_name) if chain.ik_goal_name else ""\n'
             "    })\n"
             "solvers = []\n"
             "for i in range(controller.get_num_solvers()):\n"
@@ -233,11 +235,13 @@ def register(server):
             "controller = unreal.IKRigController.get_controller(ik_rig)\n"
             "chains = []\n"
             "for chain in controller.get_retarget_chains():\n"
+            "    _sb = chain.get_editor_property('start_bone')\n"
+            "    _eb = chain.get_editor_property('end_bone')\n"
             "    chains.append({\n"
             '        "chain_name": str(chain.chain_name),\n'
-            '        "start_bone": str(chain.start_bone),\n'
-            '        "end_bone": str(chain.end_bone),\n'
-            '        "goal": str(chain.goal_name) if chain.goal_name else ""\n'
+            '        "start_bone": str(_sb.bone_name) if _sb else "",\n'
+            '        "end_bone": str(_eb.bone_name) if _eb else "",\n'
+            '        "goal": str(chain.ik_goal_name) if chain.ik_goal_name else ""\n'
             "    })\n"
             'print("__MCP_RESULT__" + json.dumps(chains))'
         )
