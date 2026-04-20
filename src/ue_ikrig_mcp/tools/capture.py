@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import os
+import tempfile
 import time
 
 from mcp.types import ImageContent, TextContent
@@ -37,27 +38,60 @@ def register(server):
         except UENotRunningError as e:
             return [TextContent(type="text", text=str(e))]
 
+        # Generate a unique screenshot path on the MCP side so we don't need to
+        # parse it back out of the Python-repr-wrapped UE response (which
+        # corrupts embedded Windows backslashes). UE writes to this path; we
+        # read it back directly.
+        ts_ms = int(time.time() * 1000)
+        # Use forward slashes so the literal in our Python script is safe from
+        # escape-sequence interpretation on both sides.
         script = wrap_script(
             "import unreal\n"
             "import os as _os\n"
-            "import time as _time\n"
             f"_w, _h = {int(width)}, {int(height)}\n"
             "_proj_saved = unreal.Paths.project_saved_dir()\n"
             "_out_dir = _os.path.join(_proj_saved, 'Screenshots', 'Claude')\n"
             "_os.makedirs(_out_dir, exist_ok=True)\n"
-            "_fname = 'capture_' + str(int(_time.time() * 1000)) + '.png'\n"
+            f"_fname = 'capture_{ts_ms}.png'\n"
             "_full_path = _os.path.abspath(_os.path.join(_out_dir, _fname))\n"
             "unreal.AutomationLibrary.take_high_res_screenshot(_w, _h, _full_path)\n"
-            'print("__MCP_RESULT__" + json.dumps({"path": _full_path}))'
+            "print('__MCP_RESULT__' + _full_path.replace('\\\\', '/'))"
         )
 
         result = conn.execute(script)
-        parsed = result.get("parsed") if isinstance(result, dict) else None
-        if not parsed or not parsed.get("path"):
-            raw = result.get("output") if isinstance(result, dict) else str(result)
-            return [TextContent(type="text", text=f"capture_viewport: failed to resolve output path. Raw output: {raw!r}")]
+        # Extract path from output — fall back to scanning the Saved/Screenshots/Claude
+        # directory for the file matching our timestamp.
+        path = None
+        if isinstance(result, dict):
+            combined = (result.get("output") or "") + (result.get("result") or "")
+            marker = "__MCP_RESULT__"
+            idx = combined.find(marker)
+            if idx != -1:
+                tail = combined[idx + len(marker):]
+                # First token up to whitespace / quote / brace
+                token = ""
+                for ch in tail:
+                    if ch in "'\"\\r\\n \t\r\n}]":
+                        break
+                    token += ch
+                if token:
+                    path = token.strip()
 
-        path = parsed["path"]
+        if not path:
+            # Fallback: locate the expected file under any known project layout.
+            # Try env var UE_PROJECT_DIR first, else walk common candidates.
+            guesses = []
+            project_dir = os.environ.get("UE_PROJECT_DIR")
+            if project_dir:
+                guesses.append(os.path.join(project_dir, "Saved", "Screenshots", "Claude", f"capture_{ts_ms}.png"))
+            for guess in guesses:
+                if os.path.exists(guess):
+                    path = guess
+                    break
+
+        if not path:
+            raw = result.get("output") if isinstance(result, dict) else str(result)
+            return [TextContent(type="text", text=f"capture_viewport: could not resolve screenshot path. Raw: {raw!r}")]
 
         # UE renders the screenshot on a subsequent editor tick, so poll the
         # filesystem from the MCP-side process (outside UE's main thread).
