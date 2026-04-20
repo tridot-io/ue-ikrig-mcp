@@ -83,7 +83,7 @@ def build_get_retargeter_controller(asset_path: str) -> str:
         f'retargeter = unreal.load_asset("{p}")\n'
         "if retargeter is None:\n"
         f'    raise ValueError("IKRetargeter asset not found: {p}")\n'
-        "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+        "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
         "if controller is None:\n"
         f'    raise ValueError("Could not get controller for: {p}")\n'
         'print("__MCP_RESULT__" + json.dumps({"path": retargeter.get_path_name()}))'

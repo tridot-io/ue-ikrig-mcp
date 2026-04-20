@@ -53,7 +53,7 @@ def register(server):
                 f'retargeter = unreal.load_asset("{afp}")\n',
                 "if retargeter is None:\n",
                 f'    raise ValueError("Retargeter not found: {afp}")\n',
-                "controller = unreal.IKRetargetController.get_controller(retargeter)\n",
+                "controller = unreal.IKRetargeterController.get_controller(retargeter)\n",
             ]
             if source_ik_rig_path:
                 srp = escape_string(source_ik_rig_path)
@@ -94,7 +94,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{p}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("Retargeter not found: {p}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "source_rig = controller.get_ik_rig(unreal.RetargetSourceOrTarget.SOURCE)\n"
             "target_rig = controller.get_ik_rig(unreal.RetargetSourceOrTarget.TARGET)\n"
             "mappings = []\n"
@@ -143,7 +143,7 @@ def register(server):
             f'    raise ValueError("Retargeter not found: {rtp}")\n'
             "if ik_rig is None:\n"
             f'    raise ValueError("IKRig not found: {irp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             f"controller.set_ik_rig({enum_val}, ik_rig)\n"
             'print("__MCP_RESULT__" + json.dumps({"success": True, "side": "' + source_or_target + '", "ik_rig": ik_rig.get_path_name()}))'
         )
@@ -172,7 +172,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("Retargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             f"controller.auto_map_chains({map_enum}, {force})\n"
             "mappings = []\n"
             "for m in controller.get_chain_mappings():\n"
@@ -207,7 +207,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("Retargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             f'controller.set_chain_mapping("{sc}", "{tc}")\n'
             'print("__MCP_RESULT__" + json.dumps({"success": True, "source_chain": "' + sc + '", "target_chain": "' + tc + '"}))'
         )
@@ -230,7 +230,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("Retargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "mappings = []\n"
             "for m in controller.get_chain_mappings():\n"
             "    mappings.append({\n"
@@ -265,7 +265,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("Retargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             f"controller.auto_align_all_bones({enum_val})\n"
             'print("__MCP_RESULT__" + json.dumps({"success": True, "side": "' + source_or_target + '"}))'
         )

@@ -41,7 +41,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f'sot = unreal.RetargetSourceOrTarget.SOURCE if "{source_or_target}" == "Source" else unreal.RetargetSourceOrTarget.TARGET\n'
@@ -80,7 +80,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f'sot = unreal.RetargetSourceOrTarget.SOURCE if "{source_or_target}" == "Source" else unreal.RetargetSourceOrTarget.TARGET\n'
@@ -120,7 +120,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f'sot = unreal.RetargetSourceOrTarget.SOURCE if "{source_or_target}" == "Source" else unreal.RetargetSourceOrTarget.TARGET\n'
@@ -161,7 +161,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f'sot = unreal.RetargetSourceOrTarget.SOURCE if "{source_or_target}" == "Source" else unreal.RetargetSourceOrTarget.TARGET\n'
@@ -192,7 +192,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f'settings = controller.get_retarget_chain_settings("{cn}")\n'
@@ -244,7 +244,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f'settings = controller.get_retarget_chain_settings("{cn}")\n'
@@ -273,7 +273,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             "settings = controller.get_global_settings()\n"
@@ -314,7 +314,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             "settings = controller.get_global_settings()\n"
@@ -349,7 +349,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f'sot = unreal.RetargetSourceOrTarget.SOURCE if "{source_or_target}" == "Source" else unreal.RetargetSourceOrTarget.TARGET\n'
@@ -383,7 +383,7 @@ def register(server):
             f'retargeter = unreal.load_asset("{rtp}")\n'
             "if retargeter is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
-            "controller = unreal.IKRetargetController.get_controller(retargeter)\n"
+            "controller = unreal.IKRetargeterController.get_controller(retargeter)\n"
             "if controller is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f'sot = unreal.RetargetSourceOrTarget.SOURCE if "{source_or_target}" == "Source" else unreal.RetargetSourceOrTarget.TARGET\n'
