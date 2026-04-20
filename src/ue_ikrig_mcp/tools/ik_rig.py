@@ -86,18 +86,18 @@ def register(server):
             "mesh_path = skm.get_path_name() if skm else None\n"
             "root_bone = controller.get_retarget_root()\n"
             "chains = []\n"
+            "def _bone_ref_name(br):\n"
+            "    return str(br.get_editor_property('bone_name')) if br is not None else ''\n"
             "for chain in controller.get_retarget_chains():\n"
-            "    _sb = chain.get_editor_property('start_bone')\n"
-            "    _eb = chain.get_editor_property('end_bone')\n"
             "    chains.append({\n"
             '        "chain_name": str(chain.chain_name),\n'
-            '        "start_bone": str(_sb.bone_name) if _sb else "",\n'
-            '        "end_bone": str(_eb.bone_name) if _eb else "",\n'
+            "        \"start_bone\": _bone_ref_name(chain.get_editor_property('start_bone')),\n"
+            "        \"end_bone\": _bone_ref_name(chain.get_editor_property('end_bone')),\n"
             '        "goal": str(chain.ik_goal_name) if chain.ik_goal_name else ""\n'
             "    })\n"
             "solvers = []\n"
             "for i in range(controller.get_num_solvers()):\n"
-            "    s = controller.get_solver_at_index(i)\n"
+            "    s = controller.get_solver_controller(i)\n"
             '    solvers.append({"index": i, "type": s.get_class().get_name(), "enabled": controller.get_solver_enabled(i)})\n'
             "goals = []\n"
             "for g in controller.get_all_goals():\n"
@@ -234,13 +234,13 @@ def register(server):
             f'    raise ValueError("IKRig not found: {rp}")\n'
             "controller = unreal.IKRigController.get_controller(ik_rig)\n"
             "chains = []\n"
+            "def _bone_ref_name(br):\n"
+            "    return str(br.get_editor_property('bone_name')) if br is not None else ''\n"
             "for chain in controller.get_retarget_chains():\n"
-            "    _sb = chain.get_editor_property('start_bone')\n"
-            "    _eb = chain.get_editor_property('end_bone')\n"
             "    chains.append({\n"
             '        "chain_name": str(chain.chain_name),\n'
-            '        "start_bone": str(_sb.bone_name) if _sb else "",\n'
-            '        "end_bone": str(_eb.bone_name) if _eb else "",\n'
+            "        \"start_bone\": _bone_ref_name(chain.get_editor_property('start_bone')),\n"
+            "        \"end_bone\": _bone_ref_name(chain.get_editor_property('end_bone')),\n"
             '        "goal": str(chain.ik_goal_name) if chain.ik_goal_name else ""\n'
             "    })\n"
             'print("__MCP_RESULT__" + json.dumps(chains))'
