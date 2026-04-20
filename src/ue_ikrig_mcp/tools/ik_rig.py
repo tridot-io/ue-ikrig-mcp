@@ -277,23 +277,20 @@ def register(server):
         except UENotRunningError as e:
             return _err(str(e))
 
-        script_rig = build_asset_registry_query("IKRigDefinition", path_filter)
-        script_retargeter = build_asset_registry_query("IKRetargeter", path_filter)
-
-        # Run both queries and combine
+        # Single editor script queries both IKRig asset types (UE 5.5+ API: class_paths + TopLevelAssetPath).
         pf = escape_string(path_filter)
         combined_script = wrap_script(
             "import unreal\n"
             "ar = unreal.AssetRegistryHelpers.get_asset_registry()\n"
             "results = {}\n"
-            "for class_name in ['IKRigDefinition', 'IKRetargeter']:\n"
+            "for class_path in ['/Script/IKRig.IKRigDefinition', '/Script/IKRig.IKRetargeter']:\n"
+            "    module, klass = class_path.rsplit('.', 1)\n"
             "    ar_filter = unreal.ARFilter()\n"
-            "    ar_filter.class_names = [class_name]\n"
-            "    ar_filter.recursive_classes = True\n"
+            "    ar_filter.class_paths = [unreal.TopLevelAssetPath(module, klass)]\n"
             "    ar_filter.recursive_paths = True\n"
             + (f'    ar_filter.package_paths = ["{pf}"]\n' if path_filter else "")
             + "    assets = ar.get_assets(ar_filter)\n"
-            '    results[class_name] = [{"path": str(a.package_name), "name": str(a.asset_name)} for a in assets]\n'
+            '    results[klass] = [{"path": str(a.package_name), "name": str(a.asset_name)} for a in assets]\n'
             'print("__MCP_RESULT__" + json.dumps(results))'
         )
         result = conn.execute(combined_script)

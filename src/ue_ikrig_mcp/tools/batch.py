@@ -115,6 +115,6 @@ def register(server):
         except UENotRunningError as e:
             return _err(str(e))
 
-        script = build_asset_registry_query("SkeletalMesh", path_filter)
+        script = build_asset_registry_query("/Script/Engine.SkeletalMesh", path_filter)
         result = conn.execute(script)
         return _ok(result)

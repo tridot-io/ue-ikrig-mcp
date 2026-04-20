@@ -90,23 +90,26 @@ def build_get_retargeter_controller(asset_path: str) -> str:
     )
 
 
-def build_asset_registry_query(class_name: str, path_filter: str = "") -> str:
-    """Build a script that queries the asset registry for assets of a given class."""
-    cn = escape_string(class_name)
+def build_asset_registry_query(class_path: str, path_filter: str = "") -> str:
+    """Build a script that queries the asset registry for assets of a given class.
+
+    class_path is a fully-qualified UE class path such as
+    "/Script/Engine.SkeletalMesh" or "/Script/IKRig.IKRigDefinition".
+    ARFilter.class_names / recursive_classes were deprecated in UE 5.5+;
+    use class_paths with TopLevelAssetPath instead.
+    """
+    cp = escape_string(class_path)
     pf = escape_string(path_filter)
-    filter_line = (
-        f'    ar_filter.package_paths = ["{pf}"]\n' if path_filter else ""
-    )
     return wrap_script(
         "import unreal\n"
         "ar = unreal.AssetRegistryHelpers.get_asset_registry()\n"
         "ar_filter = unreal.ARFilter()\n"
-        f'ar_filter.class_names = ["{cn}"]\n'
-        "ar_filter.recursive_classes = True\n"
+        f'_module, _klass = "{cp}".rsplit(".", 1)\n'
+        "ar_filter.class_paths = [unreal.TopLevelAssetPath(_module, _klass)]\n"
         "ar_filter.recursive_paths = True\n"
         + (f'ar_filter.package_paths = ["{pf}"]\n' if path_filter else "")
         + "assets = ar.get_assets(ar_filter)\n"
-        'result = [{"path": a.package_name, "name": a.asset_name} for a in assets]\n'
+        'result = [{"path": str(a.package_name), "name": str(a.asset_name)} for a in assets]\n'
         'print("__MCP_RESULT__" + json.dumps(result))'
     )
 
