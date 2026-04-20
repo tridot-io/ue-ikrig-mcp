@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ue-ikrig-mcp retargeter config / preset (v1)",
+  "description": "Schema for the JSON produced by export_retargeter_config and consumed by import_retargeter_config / apply_preset.",
+  "type": "object",
+  "required": ["schema_version", "chain_mappings"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Currently 1. Mismatched versions are rejected at import time."
+    },
+    "exported_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp of when export was run."
+    },
+    "exported_from": {
+      "type": ["string", "null"],
+      "description": "Retargeter asset path at export time. Excluded from shipped presets."
+    },
+    "is_preset": {
+      "type": "boolean",
+      "description": "True if this was saved as a preset (asset paths stripped)."
+    },
+    "note": {
+      "type": "string",
+      "description": "Optional human-readable description to display in list_available_presets."
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "rig_path": {"type": ["string", "null"]},
+        "convention": {"type": ["string", "null"]},
+        "current_pose": {"type": "string"},
+        "retarget_poses": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/definitions/retarget_pose"}
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "properties": {
+        "rig_path": {"type": ["string", "null"]},
+        "convention": {"type": ["string", "null"]},
+        "current_pose": {"type": "string"},
+        "retarget_poses": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/definitions/retarget_pose"}
+        }
+      }
+    },
+    "chain_mappings": {
+      "type": "object",
+      "additionalProperties": {"type": ["string", "null"]},
+      "description": "Target chain name -> source chain name (or null if unmapped)."
+    },
+    "ops": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["op_type", "enabled", "settings_t3d"],
+        "properties": {
+          "name": {"type": "string"},
+          "op_type": {"type": "string", "description": "UE class name of the op, e.g. IKRetargetPelvisMotionOp"},
+          "controller_type": {"type": "string"},
+          "enabled": {"type": "boolean"},
+          "settings_t3d": {"type": "string", "description": "T3D-serialized settings struct (round-trips via import_text)"}
+        }
+      }
+    },
+    "ik_chain_settings": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "enable_ik": {"type": "boolean"},
+          "blend_to_source": {"type": "number"},
+          "blend_to_source_translation": {"type": "number"},
+          "blend_to_source_rotation": {"type": "number"},
+          "static_offset": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+          "static_local_offset": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+          "static_rotation_offset": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "[pitch, yaw, roll] in degrees"},
+          "scale_vertical": {"type": "number"},
+          "extension": {"type": "number"}
+        }
+      }
+    }
+  },
+  "definitions": {
+    "retarget_pose": {
+      "type": "object",
+      "properties": {
+        "root_offset": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+        "bone_offsets_deg": {
+          "type": "object",
+          "description": "Sparse map: only non-identity offsets are recorded. Values are [roll, pitch, yaw] in degrees.",
+          "additionalProperties": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 3,
+            "maxItems": 3
+          }
+        }
+      }
+    }
+  }
+}
