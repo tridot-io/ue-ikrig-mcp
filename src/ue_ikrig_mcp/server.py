@@ -1,10 +1,8 @@
 """MCP entry point for ue-ikrig server."""
 
-import asyncio
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.fastmcp import FastMCP
 
-server = Server("ue-ikrig")
+server = FastMCP("ue-ikrig")
 
 # Import and register tools from each module
 from .tools import connection, ik_rig, retargeter, fine_tuning, batch
@@ -18,14 +16,9 @@ def register_all_tools():
     batch.register(server)
 
 
-async def main_async():
-    register_all_tools()
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
-
-
 def main():
-    asyncio.run(main_async())
+    register_all_tools()
+    server.run()
 
 
 if __name__ == "__main__":
