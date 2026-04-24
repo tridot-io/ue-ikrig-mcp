@@ -1,0 +1,512 @@
+"""Control Rig authoring — programmatic graph construction via UE's Python API.
+
+Exposes low-level wrappers around `ControlRigBlueprint` / `RigVMController` so
+LLMs (and humans via the MCP surface) can build and mutate Control Rig graphs
+without writing Python-in-Unreal boilerplate each time.
+
+These tools are intentionally small and composable — one call per API verb.
+Higher-level recipes (e.g., "make a 10-chain finger curl rig") should be built
+on top by chaining these calls, not baked into a monolithic tool.
+
+Observed from shipping examples (DazToUnreal, UE 5.6 built-ins):
+  * `blueprint.get_controller_by_name('RigVMModel')` is the canonical way to get
+    the graph controller. Fall back to `get_controller()` if named lookup fails.
+  * Struct paths drift between engine versions. The `struct_paths` arg on
+    `add_unit_node` accepts a list so callers can provide a fallback chain
+    (first that succeeds wins).
+  * Pin default values for nested USTRUCTs use string literal form like
+    '(Type=Bone,Name="hand_l")' — same as the UE text property serializer.
+  * Execution links use `.ExecuteContext` as the pin name on both sides.
+  * After batch edits call `ControlRigBlueprintLibrary.recompile_vm(bp)` then
+    `EditorAssetLibrary.save_asset(path)`.
+"""
+
+import json
+
+from mcp.types import TextContent
+
+from ..ue_connection import get_connection, UENotRunningError
+from ..ue_scripts import wrap_script, escape_string
+
+
+def _ok(data) -> list[TextContent]:
+    return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+
+def _err(msg: str) -> list[TextContent]:
+    return [TextContent(type="text", text=json.dumps({"error": True, "message": msg}, indent=2))]
+
+
+def register(server):
+    # ------------------------------------------------------------------
+    # Lifecycle: create / delete the blueprint asset
+    # ------------------------------------------------------------------
+
+    @server.tool(
+        name="cr_create_blueprint",
+        description=(
+            "Create a new ControlRigBlueprint asset at rig_path, initialized against "
+            "the provided skeleton or skeletal mesh. Overwrites any existing asset at "
+            "rig_path. Returns the created asset's path. The rig starts with an empty "
+            "Forward Solve graph (no nodes beyond the hidden BeginExecution stub)."
+        ),
+    )
+    async def cr_create_blueprint(
+        rig_path: str,
+        skeleton_or_mesh_path: str,
+    ) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+
+        rp = escape_string(rig_path)
+        sp = escape_string(skeleton_or_mesh_path)
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            f'src_path = "{sp}"\n'
+            "src = unreal.load_asset(src_path)\n"
+            "if src is None:\n"
+            f'    raise ValueError(f"Source asset not loadable: {{src_path}}")\n'
+            "if unreal.EditorAssetLibrary.does_asset_exist(rig_path):\n"
+            "    unreal.EditorAssetLibrary.delete_asset(rig_path)\n"
+            "factory = unreal.ControlRigBlueprintFactory()\n"
+            "rig_bp = None\n"
+            "try:\n"
+            "    rig_bp = factory.create_control_rig_from_skeletal_mesh_or_skeleton(selected_object=src)\n"
+            "except Exception:\n"
+            "    rig_bp = None\n"
+            "if rig_bp is None:\n"
+            "    target_dir  = rig_path.rsplit('/', 1)[0]\n"
+            "    target_name = rig_path.rsplit('/', 1)[1]\n"
+            "    tools = unreal.AssetToolsHelpers.get_asset_tools()\n"
+            "    rig_bp = tools.create_asset(target_name, target_dir, unreal.ControlRigBlueprint, factory)\n"
+            "if rig_bp is None:\n"
+            '    raise RuntimeError("Failed to create ControlRigBlueprint")\n'
+            "cur = rig_bp.get_path_name().split('.')[0]\n"
+            "if cur != rig_path:\n"
+            "    unreal.EditorAssetLibrary.rename_asset(cur, rig_path)\n"
+            "    rig_bp = unreal.load_asset(rig_path)\n"
+            "unreal.EditorAssetLibrary.save_asset(rig_path)\n"
+            'print("__MCP_RESULT__" + json.dumps({"rig_path": rig_bp.get_path_name()}))'
+        )
+        return _ok(conn.execute(script))
+
+    @server.tool(
+        name="cr_delete_blueprint",
+        description="Delete a ControlRigBlueprint asset. Safe if missing.",
+    )
+    async def cr_delete_blueprint(rig_path: str) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        rp = escape_string(rig_path)
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            "deleted = False\n"
+            "if unreal.EditorAssetLibrary.does_asset_exist(rig_path):\n"
+            "    deleted = bool(unreal.EditorAssetLibrary.delete_asset(rig_path))\n"
+            'print("__MCP_RESULT__" + json.dumps({"deleted": deleted}))'
+        )
+        return _ok(conn.execute(script))
+
+    # ------------------------------------------------------------------
+    # Variables (BP-level inputs that the owning AnimBP writes per frame)
+    # ------------------------------------------------------------------
+
+    @server.tool(
+        name="cr_add_member_variable",
+        description=(
+            "Add a member variable to the ControlRigBlueprint. cpp_type uses UE's "
+            "CPP naming: 'float', 'int32', 'FVector', 'FName', 'TArray<float>', "
+            "'TMap<FName,float>' (note: TMap is not always consumable from RigVM pins "
+            "in UE 5.x — prefer TArray<T>). is_input=True makes it an input pin on the "
+            "rig node in the owning AnimBP."
+        ),
+    )
+    async def cr_add_member_variable(
+        rig_path: str,
+        variable_name: str,
+        cpp_type: str,
+        is_input: bool = True,
+        default_value: str = "",
+    ) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        rp  = escape_string(rig_path)
+        vn  = escape_string(variable_name)
+        tp  = escape_string(cpp_type)
+        dv  = escape_string(default_value)
+        inp = "True" if is_input else "False"
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            f'name = "{vn}"\n'
+            f'tp   = "{tp}"\n'
+            f'dv   = "{dv}"\n'
+            f'is_in = {inp}\n'
+            "rig_bp = unreal.load_asset(rig_path)\n"
+            "if rig_bp is None:\n"
+            f'    raise ValueError("Rig not loadable: {rp}")\n'
+            "ok = False\n"
+            "try:\n"
+            "    rig_bp.add_member_variable(name, tp, is_in, False, dv)\n"
+            "    ok = True\n"
+            "except Exception as e:\n"
+            "    err = str(e)\n"
+            "unreal.EditorAssetLibrary.save_asset(rig_path)\n"
+            'print("__MCP_RESULT__" + json.dumps({"added": ok, "name": name, "cpp_type": tp}))'
+        )
+        return _ok(conn.execute(script))
+
+    # ------------------------------------------------------------------
+    # Graph mutation: add nodes, set pin defaults, add links
+    # ------------------------------------------------------------------
+
+    @server.tool(
+        name="cr_add_unit_node",
+        description=(
+            "Add a RigUnit (USTRUCT with RIGVM_METHOD) node to the Forward Solve graph. "
+            "struct_paths is a LIST of candidate paths — the first that succeeds is used. "
+            "Useful for engine-version portability, e.g. ["
+            "'/Script/RigVM.RigVMFunction_MathFloatMul', "
+            "'/Script/ControlRig.RigUnit_MathFloatMul']. "
+            "Returns the actual node name assigned (may be suffixed if collision)."
+        ),
+    )
+    async def cr_add_unit_node(
+        rig_path: str,
+        struct_paths: list,
+        node_name: str,
+        pos_x: float = 0.0,
+        pos_y: float = 0.0,
+        method_name: str = "Execute",
+    ) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        if not struct_paths:
+            return _err("struct_paths must be a non-empty list")
+        rp  = escape_string(rig_path)
+        nn  = escape_string(node_name)
+        mn  = escape_string(method_name)
+        paths_json = json.dumps([str(p) for p in struct_paths])
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            f'node_name = "{nn}"\n'
+            f'method_name = "{mn}"\n'
+            f'paths = {paths_json}\n'
+            f'pos = unreal.Vector2D({float(pos_x)}, {float(pos_y)})\n'
+            "rig_bp = unreal.load_asset(rig_path)\n"
+            "if rig_bp is None:\n"
+            f'    raise ValueError("Rig not loadable: {rp}")\n'
+            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
+            "if ctrl is None:\n"
+            '    raise RuntimeError("Could not acquire RigVMController")\n'
+            "added = None; used_path = None; last_err = None\n"
+            "for p in paths:\n"
+            "    try:\n"
+            "        n = ctrl.add_unit_node_from_struct_path(p, method_name, pos, node_name)\n"
+            "        if n is not None:\n"
+            "            added = n; used_path = p; break\n"
+            "    except Exception as e:\n"
+            "        last_err = str(e)\n"
+            "if added is None:\n"
+            '    raise RuntimeError(f"add_unit_node failed across {paths}: {last_err}")\n'
+            'print("__MCP_RESULT__" + json.dumps({"node": added.get_node_path(), "struct_path": used_path}))'
+        )
+        return _ok(conn.execute(script))
+
+    @server.tool(
+        name="cr_add_array_op_node",
+        description=(
+            "Add an array-operation node (Get/Set/Add/Length/Append/etc). Uses the "
+            "dedicated RigVMOpCode API — NOT add_unit_node, because ARRAY ops don't "
+            "have static struct paths (they're dispatch nodes, element-type-parameterized).\n\n"
+            "op_code: name of an RigVMOpCode enum value. Common: 'ARRAY_GET_AT_INDEX', "
+            "'ARRAY_SET_AT_INDEX', 'ARRAY_ADD', 'ARRAY_GET_NUM', 'ARRAY_ITERATOR'.\n\n"
+            "element_cpp_type: the ELEMENT type, not the array. 'float', 'int32', 'FVector', "
+            "'FName', 'FTransform', 'FRigElementKey'.\n\n"
+            "element_cpp_type_object: asset path for struct/enum element types. E.g. for "
+            "FRigElementKey use '/Script/ControlRig.RigElementKey'. Empty for primitives.\n\n"
+            "These enums are marked deprecated in some UE versions (5.5+) but still "
+            "functional — the modern replacement is DISPATCH_RigVMDispatch_Array* which "
+            "also works via this call."
+        ),
+    )
+    async def cr_add_array_op_node(
+        rig_path: str,
+        op_code: str,
+        element_cpp_type: str,
+        node_name: str,
+        pos_x: float = 0.0,
+        pos_y: float = 0.0,
+        element_cpp_type_object: str = "",
+    ) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        rp = escape_string(rig_path)
+        oc = escape_string(op_code)
+        ct = escape_string(element_cpp_type)
+        co = escape_string(element_cpp_type_object)
+        nn = escape_string(node_name)
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path  = "{rp}"\n'
+            f'op_name   = "{oc}"\n'
+            f'cpp_type  = "{ct}"\n'
+            f'type_obj  = "{co}"\n'
+            f'node_name = "{nn}"\n'
+            f'pos = unreal.Vector2D({float(pos_x)}, {float(pos_y)})\n'
+            "rig_bp = unreal.load_asset(rig_path)\n"
+            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
+            "try:\n"
+            "    op = getattr(unreal.RigVMOpCode, op_name)\n"
+            "except AttributeError:\n"
+            '    raise ValueError(f"Unknown RigVMOpCode: {op_name}. Try dir(unreal.RigVMOpCode) in console.")\n'
+            "# Primary: from_object_path variant if element type is a UObject path.\n"
+            "n = None\n"
+            "if type_obj:\n"
+            "    try:\n"
+            "        n = ctrl.add_array_node_from_object_path(op, cpp_type, type_obj, pos, node_name)\n"
+            "    except Exception: pass\n"
+            "if n is None:\n"
+            "    n = ctrl.add_array_node(op, cpp_type, None, pos, node_name)\n"
+            "if n is None:\n"
+            '    raise RuntimeError("add_array_node returned None")\n'
+            'print("__MCP_RESULT__" + json.dumps({"node": n.get_node_path(), "op": op_name, "element_type": cpp_type}))'
+        )
+        return _ok(conn.execute(script))
+
+    @server.tool(
+        name="cr_add_template_node",
+        description=(
+            "Add a template (variadic) node — signatures look like "
+            "'Make Relative::Execute(in Global,in Parent,out Local)'. Used when the "
+            "unit supports multiple pin-type combinations; the signature disambiguates."
+        ),
+    )
+    async def cr_add_template_node(
+        rig_path: str,
+        template_notation: str,
+        node_name: str,
+        pos_x: float = 0.0,
+        pos_y: float = 0.0,
+    ) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        rp = escape_string(rig_path)
+        tn = escape_string(template_notation)
+        nn = escape_string(node_name)
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            f'notation = "{tn}"\n'
+            f'node_name = "{nn}"\n'
+            f'pos = unreal.Vector2D({float(pos_x)}, {float(pos_y)})\n'
+            "rig_bp = unreal.load_asset(rig_path)\n"
+            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
+            "n = ctrl.add_template_node(notation, pos, node_name)\n"
+            "if n is None:\n"
+            '    raise RuntimeError("add_template_node returned None")\n'
+            'print("__MCP_RESULT__" + json.dumps({"node": n.get_node_path(), "template": notation}))'
+        )
+        return _ok(conn.execute(script))
+
+    @server.tool(
+        name="cr_add_variable_node",
+        description=(
+            "Add a variable-get or variable-set node to the graph (not the BP member "
+            "variable — that's cr_add_member_variable). is_getter=True for Get, "
+            "False for Set."
+        ),
+    )
+    async def cr_add_variable_node(
+        rig_path: str,
+        variable_name: str,
+        cpp_type: str,
+        is_getter: bool = True,
+        pos_x: float = 0.0,
+        pos_y: float = 0.0,
+        node_name: str = "",
+    ) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        rp = escape_string(rig_path)
+        vn = escape_string(variable_name)
+        tp = escape_string(cpp_type)
+        nn = escape_string(node_name)
+        is_g = "True" if is_getter else "False"
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            f'var_name = "{vn}"\n'
+            f'cpp_type = "{tp}"\n'
+            f'node_name = "{nn}"\n'
+            f'is_g = {is_g}\n'
+            f'pos = unreal.Vector2D({float(pos_x)}, {float(pos_y)})\n'
+            "rig_bp = unreal.load_asset(rig_path)\n"
+            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
+            "n = ctrl.add_variable_node(var_name, cpp_type, None, is_g, '', pos, node_name)\n"
+            "if n is None:\n"
+            '    raise RuntimeError("add_variable_node returned None")\n'
+            'print("__MCP_RESULT__" + json.dumps({"node": n.get_node_path()}))'
+        )
+        return _ok(conn.execute(script))
+
+    @server.tool(
+        name="cr_set_pin_default",
+        description=(
+            "Set a pin's default value. pin_path is '<node_name>.<PinName>' (dot-"
+            "separated for nested subpins, e.g. 'Off_hand_l.OffsetTransform.Rotation'). "
+            "Struct pins accept UE text form, e.g. '(Type=Bone,Name=\"hand_l\")' for a "
+            "FRigElementKey, '(X=0.0,Y=0.0,Z=1.0)' for FVector."
+        ),
+    )
+    async def cr_set_pin_default(
+        rig_path: str,
+        pin_path: str,
+        value: str,
+        resize_arrays: bool = False,
+    ) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        rp = escape_string(rig_path)
+        pp = escape_string(pin_path)
+        vv = escape_string(value)
+        ra = "True" if resize_arrays else "False"
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            f'pin_path = "{pp}"\n'
+            f'value = "{vv}"\n'
+            f'ra = {ra}\n'
+            "rig_bp = unreal.load_asset(rig_path)\n"
+            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
+            "ok = ctrl.set_pin_default_value(pin_path, value, ra)\n"
+            'print("__MCP_RESULT__" + json.dumps({"set": bool(ok), "pin": pin_path}))'
+        )
+        return _ok(conn.execute(script))
+
+    @server.tool(
+        name="cr_add_link",
+        description=(
+            "Connect two pins. from_pin is the output pin (e.g. 'Mul_hand_l.Result'), "
+            "to_pin is the input (e.g. 'Quat_hand_l.Angle'). For execution chains use "
+            "'NodeA.ExecuteContext' -> 'NodeB.ExecuteContext'."
+        ),
+    )
+    async def cr_add_link(
+        rig_path: str,
+        from_pin: str,
+        to_pin: str,
+    ) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        rp = escape_string(rig_path)
+        fp = escape_string(from_pin)
+        tp = escape_string(to_pin)
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            f'fp = "{fp}"\n'
+            f'tp = "{tp}"\n'
+            "rig_bp = unreal.load_asset(rig_path)\n"
+            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
+            "ok = ctrl.add_link(fp, tp)\n"
+            'print("__MCP_RESULT__" + json.dumps({"linked": bool(ok), "from": fp, "to": tp}))'
+        )
+        return _ok(conn.execute(script))
+
+    # ------------------------------------------------------------------
+    # Introspection / finalize
+    # ------------------------------------------------------------------
+
+    @server.tool(
+        name="cr_dump_graph",
+        description=(
+            "List all nodes and links in the Forward Solve graph. Useful for verifying "
+            "a scripted build, diffing between versions, or checking what a rig contains "
+            "before modifying it."
+        ),
+    )
+    async def cr_dump_graph(rig_path: str) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        rp = escape_string(rig_path)
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            "rig_bp = unreal.load_asset(rig_path)\n"
+            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
+            "graph = ctrl.get_graph() if hasattr(ctrl, 'get_graph') else rig_bp.get_rig_vm_graph()\n"
+            "nodes_out = []\n"
+            "links_out = []\n"
+            "try:\n"
+            "    for n in graph.get_nodes():\n"
+            "        entry = {'name': n.get_node_path()}\n"
+            "        try: entry['title'] = n.get_node_title()\n"
+            "        except Exception: pass\n"
+            "        try: entry['kind'] = type(n).__name__\n"
+            "        except Exception: pass\n"
+            "        nodes_out.append(entry)\n"
+            "except Exception as e:\n"
+            "    nodes_out.append({'err': str(e)})\n"
+            "try:\n"
+            "    for l in graph.get_links():\n"
+            "        try:\n"
+            "            links_out.append({'from': l.get_source_pin().get_pin_path(),\n"
+            "                              'to':   l.get_target_pin().get_pin_path()})\n"
+            "        except Exception as e:\n"
+            "            links_out.append({'err': str(e)})\n"
+            "except Exception as e:\n"
+            "    links_out.append({'err': str(e)})\n"
+            'print("__MCP_RESULT__" + json.dumps({"node_count": len(nodes_out), "nodes": nodes_out[:200], "link_count": len(links_out), "links": links_out[:400]}))'
+        )
+        return _ok(conn.execute(script))
+
+    @server.tool(
+        name="cr_compile_and_save",
+        description=(
+            "Recompile the RigVM and save the asset. Call this after a batch of graph "
+            "edits so changes are persisted and any compile errors surface."
+        ),
+    )
+    async def cr_compile_and_save(rig_path: str) -> list[TextContent]:
+        try:
+            conn = get_connection()
+        except UENotRunningError as e:
+            return _err(str(e))
+        rp = escape_string(rig_path)
+        script = wrap_script(
+            "import unreal\n"
+            f'rig_path = "{rp}"\n'
+            "rig_bp = unreal.load_asset(rig_path)\n"
+            "compile_err = None\n"
+            "try:\n"
+            "    unreal.ControlRigBlueprintLibrary.recompile_vm(rig_bp)\n"
+            "except Exception as e:\n"
+            "    compile_err = str(e)\n"
+            "saved = bool(unreal.EditorAssetLibrary.save_asset(rig_path))\n"
+            'print("__MCP_RESULT__" + json.dumps({"saved": saved, "compile_error": compile_err}))'
+        )
+        return _ok(conn.execute(script))

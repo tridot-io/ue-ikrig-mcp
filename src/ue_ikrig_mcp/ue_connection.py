@@ -21,8 +21,8 @@ _NODE_TIMEOUT_SECONDS = 5
 _DEFAULT_RECEIVE_BUFFER_SIZE = 8192
 
 MULTICAST_GROUP = ('239.0.0.1', 6766)
-MULTICAST_BIND_ADDRESS = '127.0.0.1'
-COMMAND_ENDPOINT = ('127.0.0.1', 6776)
+MULTICAST_BIND_ADDRESS = '0.0.0.0'
+COMMAND_ENDPOINT = ('0.0.0.0', 6777)
 
 _MCP_RESULT_SENTINEL = '__MCP_RESULT__'
 
@@ -245,14 +245,19 @@ class UEConnection:
             self._command_listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         else:
             self._command_listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._command_listen_socket.bind(COMMAND_ENDPOINT)
+        
+        # Bind to all interfaces to be permissive
+        self._command_listen_socket.bind(('0.0.0.0', COMMAND_ENDPOINT[1]))
         self._command_listen_socket.listen(1)
         self._command_listen_socket.settimeout(5)
 
         # Attempt to have UE connect back to us
+        # Since we are on the same machine, 127.0.0.1 is the most reliable callback IP.
+        callback_ip = '127.0.0.1'
+
         for _ in range(6):
             self._send_broadcast(_Message(_TYPE_OPEN_CONNECTION, self._node_id, node_id, {
-                'command_ip': COMMAND_ENDPOINT[0],
+                'command_ip': callback_ip,
                 'command_port': COMMAND_ENDPOINT[1],
             }))
             try:
