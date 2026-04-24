@@ -488,7 +488,11 @@ def register(server):
         name="cr_compile_and_save",
         description=(
             "Recompile the RigVM and save the asset. Call this after a batch of graph "
-            "edits so changes are persisted and any compile errors surface."
+            "edits so changes are persisted and any compile errors surface. Tails the "
+            "active UE log during the compile window and returns structured warnings "
+            "and errors (category + message) plus the blueprint's post-compile status. "
+            "Python stdout alone misses UE_LOG-level diagnostics; the log tail is what "
+            "makes compile failures visible."
         ),
     )
     async def cr_compile_and_save(rig_path: str) -> list[TextContent]:
@@ -498,15 +502,70 @@ def register(server):
             return _err(str(e))
         rp = escape_string(rig_path)
         script = wrap_script(
-            "import unreal\n"
+            "import unreal, os, glob\n"
             f'rig_path = "{rp}"\n'
             "rig_bp = unreal.load_asset(rig_path)\n"
+            "if rig_bp is None:\n"
+            f'    raise ValueError("ControlRigBlueprint not found: {rp}")\n'
+            # Locate the active UE log file (most recently modified .log in the project log dir).
+            "log_dir = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_log_dir())\n"
+            "active_log = None\n"
+            "pre_size = 0\n"
+            "try:\n"
+            "    candidates = [(p, os.path.getmtime(p)) for p in glob.glob(os.path.join(log_dir, '*.log'))]\n"
+            "    candidates.sort(key=lambda t: t[1], reverse=True)\n"
+            "    if candidates:\n"
+            "        active_log = candidates[0][0]\n"
+            "        pre_size = os.path.getsize(active_log)\n"
+            "except Exception:\n"
+            "    pass\n"
+            # Compile — catch Python-level errors separately from C++ UE_LOG diagnostics.
             "compile_err = None\n"
             "try:\n"
             "    unreal.ControlRigBlueprintLibrary.recompile_vm(rig_bp)\n"
-            "except Exception as e:\n"
-            "    compile_err = str(e)\n"
+            "except Exception as _e:\n"
+            "    compile_err = str(_e)\n"
+            # Tail the log for compile-category diagnostics written during the window.
+            "warnings_out = []\n"
+            "errors_out = []\n"
+            "_CATS = ('LogControlRig', 'LogRigVM', 'LogBlueprint', 'LogClass', 'LogAsset', 'LogPython', 'LogKismet')\n"
+            "if active_log:\n"
+            "    try:\n"
+            "        with open(active_log, 'r', encoding='utf-8', errors='ignore') as _fh:\n"
+            "            _fh.seek(pre_size)\n"
+            "            _tail = _fh.read()\n"
+            "        for _line in _tail.splitlines():\n"
+            "            _line = _line.strip()\n"
+            "            if not _line:\n"
+            "                continue\n"
+            "            if not any(_c in _line for _c in _CATS):\n"
+            "                continue\n"
+            "            if ': Error:' in _line:\n"
+            "                errors_out.append(_line)\n"
+            "            elif ': Warning:' in _line:\n"
+            "                warnings_out.append(_line)\n"
+            "    except Exception:\n"
+            "        pass\n"
+            # Post-compile blueprint status — enum name + human-readable summary.
+            "status_name = None\n"
+            "status_message = None\n"
+            "try:\n"
+            "    _s = rig_bp.get_editor_property('status')\n"
+            "    status_name = str(_s).split('.')[-1].split(':')[0].strip() if _s is not None else None\n"
+            "except Exception:\n"
+            "    pass\n"
+            "try:\n"
+            "    status_message = str(rig_bp.get_editor_property('status_message'))\n"
+            "except Exception:\n"
+            "    pass\n"
             "saved = bool(unreal.EditorAssetLibrary.save_asset(rig_path))\n"
-            'print("__MCP_RESULT__" + json.dumps({"saved": saved, "compile_error": compile_err}))'
+            "_success = compile_err is None and not errors_out and (status_name not in ('ERROR', 'BS_ERROR'))\n"
+            'print("__MCP_RESULT__" + json.dumps({'
+            '"saved": saved, "compile_error": compile_err, '
+            '"status": status_name, "status_message": status_message, '
+            '"errors": errors_out, "warnings": warnings_out, '
+            '"error_count": len(errors_out), "warning_count": len(warnings_out), '
+            '"success": _success, "log_file": active_log'
+            '}))'
         )
         return _ok(conn.execute(script))
