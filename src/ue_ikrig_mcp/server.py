@@ -1,6 +1,7 @@
 """MCP entry point for ue-ikrig server."""
 
 from mcp.server.fastmcp import FastMCP
+from .ue_connection import register_process_cleanup
 
 server = FastMCP("ue-ikrig")
 
@@ -48,6 +49,7 @@ def register_all_tools():
 
 
 def main():
+    register_process_cleanup()
     register_all_tools()
     server.run()
 

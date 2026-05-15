@@ -33,10 +33,7 @@ def register(server, connection=None):
         conn = _conn()
         try:
             conn.connect(node_id=node_id)
-            result = {
-                "connected": True,
-                "node_id": conn.get_connected_node_id(),
-            }
+            result = conn.get_status()
         except UENotRunningError as e:
             result = {"connected": False, "error": str(e)}
         except UEConnectionError as e:
@@ -44,11 +41,21 @@ def register(server, connection=None):
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     @server.tool()
+    async def disconnect_editor() -> list[TextContent]:
+        """Close the UE command channel and discovery sockets held by this MCP process."""
+        conn = _conn()
+        previous = conn.get_status()
+        conn.disconnect()
+        result = {
+            "disconnected": True,
+            "previous": previous,
+            "current": conn.get_status(),
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    @server.tool()
     async def connection_status() -> list[TextContent]:
         """Return the current connection status to Unreal Editor."""
         conn = _conn()
-        if conn.is_connected():
-            result = {"connected": True, "node_id": conn.get_connected_node_id()}
-        else:
-            result = {"connected": False, "node_id": None}
+        result = conn.get_status()
         return [TextContent(type="text", text=json.dumps(result, indent=2))]

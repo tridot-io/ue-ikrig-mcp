@@ -37,11 +37,12 @@ pip install git+https://github.com/tridot-io/ue-ikrig-mcp.git
 ue-ikrig-mcp
 ```
 
-## Tools (33 total)
+## Tools
 
-### Connection (3)
+### Connection (4)
 - `discover_editors` - Find running UE Editor instances
 - `connect_to_editor` - Open command channel to an editor
+- `disconnect_editor` - Close the command/discovery sockets held by this MCP process
 - `connection_status` - Check connection state
 
 ### IK Rig (10)
@@ -81,7 +82,7 @@ ue-ikrig-mcp
 Claude Code  <--stdio-->  MCP Server (Python)  <--UDP/TCP-->  UE Editor
 ```
 
-The server communicates with UE Editor via the built-in Python Remote Execution protocol (UDP multicast discovery + TCP commands).
+The server communicates with UE Editor via the built-in Python Remote Execution protocol (UDP multicast discovery + TCP commands). If the configured command port is still held by another local MCP process, `connect_to_editor` automatically falls back to a free local port unless `UE_COMMAND_PORT_STRICT=true` is set.
 
 ## License
 
