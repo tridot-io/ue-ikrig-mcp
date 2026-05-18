@@ -106,6 +106,11 @@ ue-ikrig-mcp
 - `execute_python` - Raw Python escape hatch
 - `list_skeletal_meshes` - Find skeletal meshes
 
+### Capture (3)
+- `capture_viewport` - Level editor viewport screenshot via UE AutomationLibrary (hardened with realtime/repaint forcing)
+- `capture_ue_window` - OS-level window or tab screenshot with PrintWindow fallback (works for any visible UE window)
+- `capture_asset_editor` - Open an asset in its editor and capture the preview viewport (IK Retargeter, AnimBP, SkeletalMesh, PhysicsAsset, ControlRig)
+
 ## Architecture
 
 ```

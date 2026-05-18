@@ -7,7 +7,7 @@ server = FastMCP("ue-ikrig")
 
 # Import and register tools from each module
 from .tools import (
-    connection, ik_rig, retargeter, fine_tuning, batch, capture, capture_os,
+    connection, ik_rig, retargeter, fine_tuning, batch, capture, capture_os, capture_asset_editor,
     retargeter_advanced, ergonomics, validation, op_stack, config_io, preview,
     op_management, fk_chains, animbp_inspect,
     fbik_tuning, phat_diagnostics, bone_diagnostics,
@@ -25,6 +25,7 @@ def register_all_tools():
     batch.register(server)
     capture.register(server)
     capture_os.register(server)
+    capture_asset_editor.register(server)
     retargeter_advanced.register(server)
     ergonomics.register(server)
     validation.register(server)
