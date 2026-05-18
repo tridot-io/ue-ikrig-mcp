@@ -11,9 +11,33 @@ def register(server, connection=None):
         return connection if connection is not None else get_connection()
 
     @server.tool()
+    async def preflight_discovery(
+        timeout_seconds: float = 2.0,
+        test_callback: bool = True,
+        callback_timeout_seconds: float = 2.0,
+    ) -> list[TextContent]:
+        """
+        Run deterministic UE Remote Execution transport diagnostics.
+
+        This sends the exact UDP ping packet used by Unreal's Python Remote
+        Execution protocol, waits for pongs, and only then optionally tests the
+        TCP callback/open_connection path. It does not execute Python in Unreal.
+        """
+        conn = _conn()
+        result = conn.preflight_discovery(
+            timeout=timeout_seconds,
+            test_callback=test_callback,
+            callback_timeout=callback_timeout_seconds,
+        )
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    @server.tool()
     async def discover_editors() -> list[TextContent]:
         """Discover running Unreal Editor instances on the local network."""
         conn = _conn()
+        nodes = conn.get_remote_nodes()
+        if nodes:
+            return [TextContent(type="text", text=json.dumps(nodes, indent=2))]
         if not conn._running:
             conn.start_discovery()
             import asyncio

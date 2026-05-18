@@ -6,7 +6,11 @@ import logging
 import threading
 import errno
 import os
+import sys
 import atexit
+import shutil
+import subprocess
+import tempfile
 from typing import Optional, Any
 
 # Protocol constants
@@ -22,6 +26,309 @@ _TYPE_COMMAND_RESULT = 'command_result'
 _NODE_PING_SECONDS = 1
 _NODE_TIMEOUT_SECONDS = 5
 _DEFAULT_RECEIVE_BUFFER_SIZE = 8192
+_WINDOWS_BRIDGE_RESULT_PREFIX = '__UE_IKRIG_MCP_BRIDGE_RESULT__'
+
+_WINDOWS_BRIDGE_SCRIPT = r'''
+import json
+import socket
+import sys
+import time
+import traceback
+import uuid
+
+PROTOCOL_VERSION = 1
+PROTOCOL_MAGIC = "ue_py"
+TYPE_PING = "ping"
+TYPE_PONG = "pong"
+TYPE_OPEN_CONNECTION = "open_connection"
+TYPE_COMMAND = "command"
+TYPE_COMMAND_RESULT = "command_result"
+BUFFER_SIZE = 8192
+RESULT_PREFIX = "__UE_IKRIG_MCP_BRIDGE_RESULT__"
+
+
+def emit(payload):
+    print(RESULT_PREFIX + json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def make_message(type_, source, dest=None, data=None):
+    obj = {
+        "version": PROTOCOL_VERSION,
+        "magic": PROTOCOL_MAGIC,
+        "type": type_,
+        "source": source,
+    }
+    if dest:
+        obj["dest"] = dest
+    if data:
+        obj["data"] = data
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+
+def parse_message(data):
+    obj = json.loads(data.decode("utf-8"))
+    if obj["version"] != PROTOCOL_VERSION:
+        raise ValueError("Bad protocol version")
+    if obj["magic"] != PROTOCOL_MAGIC:
+        raise ValueError("Bad protocol magic")
+    return obj
+
+
+def passes_receive_filter(msg, source_id):
+    return msg.get("source") != source_id and (not msg.get("dest") or msg.get("dest") == source_id)
+
+
+def local_ipv4_candidates():
+    addresses = []
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        infos = []
+    for info in infos:
+        address = info[4][0]
+        if address and address not in addresses:
+            addresses.append(address)
+    route_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        route_probe.connect(("8.8.8.8", 80))
+        address = route_probe.getsockname()[0]
+        if address and address not in addresses:
+            addresses.append(address)
+    except OSError:
+        pass
+    finally:
+        route_probe.close()
+    return addresses
+
+
+def target_candidates(group_host, port, configured_targets=None):
+    targets = []
+
+    def add(host):
+        if host and (host, port) not in targets:
+            targets.append((host, port))
+
+    add(group_host)
+    add("127.0.0.1")
+    for item in configured_targets or []:
+        if isinstance(item, (list, tuple)) and item:
+            add(str(item[0]))
+        elif isinstance(item, str):
+            add(item)
+    for address in local_ipv4_candidates():
+        add(address)
+    return targets
+
+
+def open_udp_socket(group_host, port, ttl, timeout):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+    sock.bind(("0.0.0.0", port))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, int(ttl))
+    try:
+        sock.setsockopt(
+            socket.IPPROTO_IP,
+            socket.IP_ADD_MEMBERSHIP,
+            socket.inet_aton(group_host) + socket.inet_aton("0.0.0.0"),
+        )
+    except OSError:
+        # Direct unicast probes can still reach editors bound on loopback or a
+        # concrete Windows adapter even if multicast membership is rejected.
+        pass
+    sock.settimeout(timeout)
+    return sock
+
+
+def discover(payload):
+    group_host, port = payload.get("group", ["239.0.0.1", 6766])
+    port = int(port)
+    ttl = int(payload.get("ttl", 1))
+    timeout = max(0.1, float(payload.get("timeout", 2.0)))
+    source_id = payload.get("source_id") or str(uuid.uuid4())
+    targets = target_candidates(group_host, port, payload.get("targets"))
+    nodes = {}
+    parse_errors = []
+    sock = open_udp_socket(group_host, port, ttl, 0.05)
+    try:
+        deadline = time.time() + timeout
+        next_send = 0.0
+        ping = make_message(TYPE_PING, source_id)
+        while time.time() < deadline:
+            now = time.time()
+            if now >= next_send:
+                for target in targets:
+                    try:
+                        sock.sendto(ping, target)
+                    except OSError:
+                        pass
+                next_send = now + 0.25
+            try:
+                data, source_address = sock.recvfrom(BUFFER_SIZE)
+            except socket.timeout:
+                continue
+            try:
+                msg = parse_message(data)
+            except Exception as exc:
+                parse_errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+            if not passes_receive_filter(msg, source_id) or msg.get("type") != TYPE_PONG:
+                continue
+            node_id = msg.get("source")
+            if not node_id:
+                continue
+            node = dict(msg.get("data") or {})
+            node["node_id"] = node_id
+            node["_source_address"] = list(source_address)
+            nodes[node_id] = node
+    finally:
+        sock.close()
+    return {
+        "ok": bool(nodes),
+        "nodes": list(nodes.values()),
+        "source_id": source_id,
+        "targets": [list(item) for item in targets],
+        "parse_errors": parse_errors[-10:],
+    }
+
+
+def recv_full(conn, timeout):
+    conn.settimeout(timeout)
+    data = b""
+    while True:
+        part = conn.recv(BUFFER_SIZE)
+        if not part:
+            break
+        data += part
+        if len(part) < BUFFER_SIZE:
+            break
+    return data
+
+
+def execute(payload):
+    group_host, port = payload.get("group", ["239.0.0.1", 6766])
+    port = int(port)
+    ttl = int(payload.get("ttl", 1))
+    timeout = max(0.1, float(payload.get("timeout", 30.0)))
+    source_id = payload.get("source_id") or str(uuid.uuid4())
+    node_id = payload.get("node_id")
+    targets = target_candidates(group_host, port, payload.get("targets"))
+    if not node_id:
+        discovery = discover({
+            "group": [group_host, port],
+            "ttl": ttl,
+            "timeout": min(timeout, 5.0),
+            "source_id": source_id,
+            "targets": payload.get("targets"),
+        })
+        if not discovery.get("nodes"):
+            return {
+                "ok": False,
+                "error": "No Unreal Editor instances discovered from Windows bridge.",
+                "discovery": discovery,
+            }
+        node_id = discovery["nodes"][0]["node_id"]
+
+    udp = open_udp_socket(group_host, port, ttl, 0.05)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(0.25)
+    command_port = listener.getsockname()[1]
+    callback = {
+        "command_ip": "127.0.0.1",
+        "command_port": command_port,
+    }
+    try:
+        open_message = make_message(TYPE_OPEN_CONNECTION, source_id, node_id, callback)
+        deadline = time.time() + timeout
+        channel = None
+        while time.time() < deadline:
+            for target in targets:
+                try:
+                    udp.sendto(open_message, target)
+                except OSError:
+                    pass
+            try:
+                channel, address = listener.accept()
+                break
+            except socket.timeout:
+                continue
+        if channel is None:
+            return {
+                "ok": False,
+                "error": "Unreal Editor did not connect back to the Windows bridge.",
+                "callback": callback,
+                "targets": [list(item) for item in targets],
+            }
+        with channel:
+            command = make_message(TYPE_COMMAND, source_id, node_id, {
+                "command": payload.get("code", ""),
+                "unattended": True,
+                "exec_mode": payload.get("mode", "ExecuteFile"),
+            })
+            channel.sendall(command)
+            data = recv_full(channel, timeout)
+        if not data:
+            return {"ok": False, "error": "No command response received from Unreal Editor."}
+        response = parse_message(data)
+        if not passes_receive_filter(response, source_id) or response.get("type") != TYPE_COMMAND_RESULT:
+            return {
+                "ok": False,
+                "error": "Unexpected command response from Unreal Editor.",
+                "response_type": response.get("type"),
+            }
+        return {
+            "ok": True,
+            "node_id": node_id,
+            "callback": callback,
+            "targets": [list(item) for item in targets],
+            "result": response.get("data") or {},
+        }
+    finally:
+        udp.close()
+        listener.close()
+
+
+def main():
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    try:
+        op = payload.get("op")
+        if op == "discover":
+            emit(discover(payload))
+            return
+        if op == "execute":
+            emit(execute(payload))
+            return
+        emit({"ok": False, "error": f"Unsupported bridge operation: {op!r}"})
+    except Exception as exc:
+        emit({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        })
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+_WINDOWS_BRIDGE_LAUNCHER_SCRIPT = (
+    "param([string]$ScriptPath, [string]$PayloadPath)\n"
+    "$ErrorActionPreference = 'Stop'\n"
+    "$py = Get-Command py -ErrorAction SilentlyContinue\n"
+    "if ($py) { & $py.Source -3 $ScriptPath $PayloadPath; exit $LASTEXITCODE }\n"
+    "$python = Get-Command python -ErrorAction SilentlyContinue\n"
+    "if ($python) { & $python.Source $ScriptPath $PayloadPath; exit $LASTEXITCODE }\n"
+    "throw 'Windows Python was not found on PATH.'\n"
+)
+
 
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -45,10 +352,331 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return default
 
 
+def _write_temp_text(content: str, *, suffix: str, prefix: str) -> str:
+    with tempfile.NamedTemporaryFile(
+        'w',
+        suffix=suffix,
+        prefix=prefix,
+        delete=False,
+        encoding='utf-8',
+    ) as temp_file:
+        temp_file.write(content)
+        return temp_file.name
+
+
+def _windows_bridge_failure(error: str, **details: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {'ok': False, 'error': error}
+    result.update(details)
+    return result
+
+
+def _split_address_list(raw: Optional[str], default: list[str]) -> list[str]:
+    """Parse comma/semicolon separated IPv4 address candidates."""
+    if raw is None or raw.strip() == '':
+        return list(default)
+    parts = raw.replace(';', ',').split(',')
+    result: list[str] = []
+    for part in parts:
+        value = part.strip()
+        if value and value not in result:
+            result.append(value)
+    return result or list(default)
+
+
+def _dedupe_addresses(addresses: list[Optional[str]]) -> list[str]:
+    result: list[str] = []
+    for address in addresses:
+        value = (address or '').strip()
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _is_wildcard_host(host: str) -> bool:
+    return host in ('', '0.0.0.0', '::')
+
+
+def _is_wsl(osrelease: Optional[str] = None, proc_version: Optional[str] = None) -> bool:
+    """Return True when running inside WSL/WSL2."""
+    if osrelease is None:
+        try:
+            with open('/proc/sys/kernel/osrelease', 'r', encoding='utf-8') as f:
+                osrelease = f.read()
+        except OSError:
+            osrelease = ''
+    if proc_version is None:
+        try:
+            with open('/proc/version', 'r', encoding='utf-8') as f:
+                proc_version = f.read()
+        except OSError:
+            proc_version = ''
+    probe = f'{osrelease}\n{proc_version}'.lower()
+    return 'microsoft' in probe or 'wsl' in probe
+
+
+def _read_resolv_nameserver(path: str = '/etc/resolv.conf') -> Optional[str]:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('nameserver '):
+                    value = stripped.split(None, 1)[1].strip()
+                    if value:
+                        return value
+    except OSError:
+        return None
+    return None
+
+
+def _local_ipv4_for_remote(remote_host: str) -> Optional[str]:
+    """Infer the local IPv4 selected for a remote route without sending data."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((remote_host, 80))
+        local_ip = sock.getsockname()[0]
+        return local_ip if local_ip and local_ip != '0.0.0.0' else None
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def _hostname_ipv4_addresses() -> list[str]:
+    addresses: list[str] = []
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        infos = []
+    for info in infos:
+        address = info[4][0]
+        if address and address not in addresses:
+            addresses.append(address)
+    return addresses
+
+
+def _infer_wsl_local_ipv4(
+    *,
+    is_wsl: Optional[bool] = None,
+    nameserver: Optional[str] = None,
+) -> Optional[str]:
+    """Infer the WSL-side local IPv4 that Windows can call back to.
+
+    The `/etc/resolv.conf` nameserver usually points at the Windows host/gateway.
+    We use it only as a route target to ask the kernel which local WSL interface
+    address would be used; we do not advertise the Windows gateway as the
+    callback address.
+    """
+    if is_wsl is None:
+        is_wsl = _is_wsl()
+    if not is_wsl:
+        return None
+    target = nameserver or _read_resolv_nameserver()
+    if not target:
+        return None
+    return _local_ipv4_for_remote(target)
+
+
+def _infer_wsl_callback_ipv4(
+    multicast_host: str,
+    *,
+    is_wsl: Optional[bool] = None,
+    nameserver: Optional[str] = None,
+) -> Optional[str]:
+    if is_wsl is None:
+        is_wsl = _is_wsl()
+    if not is_wsl:
+        return None
+    return (
+        _local_ipv4_for_remote(multicast_host)
+        or _infer_wsl_local_ipv4(is_wsl=is_wsl, nameserver=nameserver)
+    )
+
+
+def _network_diagnostics(multicast_host: str) -> dict[str, Any]:
+    nameserver = _read_resolv_nameserver()
+    wsl_detected = _is_wsl()
+    return {
+        'platform': sys.platform,
+        'os_name': os.name,
+        'hostname': socket.gethostname(),
+        'hostname_ipv4_addresses': _hostname_ipv4_addresses(),
+        'wsl_detected': wsl_detected,
+        'resolv_nameserver': nameserver,
+        'route_ipv4_to_multicast_group': _local_ipv4_for_remote(multicast_host),
+        'route_ipv4_to_wsl_nameserver': (
+            _local_ipv4_for_remote(nameserver) if nameserver else None
+        ),
+    }
+
+
+def _callback_host_for(
+    listen_host: str,
+    *,
+    explicit_host: Optional[str] = None,
+    wsl_local_ip: Optional[str] = None,
+) -> str:
+    explicit = explicit_host.strip() if explicit_host else ''
+    if explicit and not _is_wildcard_host(explicit):
+        return explicit
+    if not _is_wildcard_host(listen_host):
+        return listen_host
+    if wsl_local_ip:
+        return wsl_local_ip
+    if listen_host == '::':
+        return '::1'
+    return '127.0.0.1'
+
+
+def _callback_host_config_error(explicit_host: Optional[str]) -> Optional[str]:
+    explicit = explicit_host.strip() if explicit_host else ''
+    if explicit and _is_wildcard_host(explicit):
+        return (
+            'UE_CALLBACK_HOST cannot be a wildcard address; it will not be '
+            'advertised to Unreal. Use a reachable concrete host/IP instead.'
+        )
+    return None
+
+
+def _find_powershell_executable() -> Optional[str]:
+    powershell = shutil.which('powershell.exe')
+    if powershell:
+        return powershell
+    fallback = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+    return fallback if os.path.exists(fallback) else None
+
+
+def _wsl_path_to_windows(path: str) -> str:
+    try:
+        result = subprocess.run(
+            ['wslpath', '-w', path],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return path
+    converted = result.stdout.strip()
+    return converted or path
+
+
+def _ue_output_to_string(value: Any) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict) and 'output' in item:
+                parts.append(str(item.get('output') or ''))
+            else:
+                parts.append(str(item))
+        return ''.join(parts)
+    return str(value)
+
+
+def _normalize_command_result(result_data: dict[str, Any]) -> dict[str, Any]:
+    success = bool(result_data.get('success', False))
+    result_str = _ue_output_to_string(result_data.get('result', ''))
+    output_str = _ue_output_to_string(result_data.get('output', ''))
+
+    parsed = None
+    combined = output_str + result_str
+    sentinel_idx = combined.find(_MCP_RESULT_SENTINEL)
+    if sentinel_idx != -1:
+        json_str = combined[sentinel_idx + len(_MCP_RESULT_SENTINEL):].strip()
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(json_str)
+        except json.JSONDecodeError:
+            logger.debug('Failed to parse MCP result JSON: %s', json_str[:200])
+
+    return {
+        'success': success,
+        'result': result_str,
+        'output': output_str,
+        'parsed': parsed,
+    }
+
+
+def _multicast_socket_candidates(
+    bind_candidates: list[str],
+    interface_candidates: list[str],
+    membership_candidates: list[str],
+) -> list[tuple[str, str, str]]:
+    """Return bind/outbound-interface/membership-interface combinations."""
+    candidates: list[tuple[str, str, str]] = []
+    for bind_address in bind_candidates:
+        outbound_addresses = interface_candidates or [bind_address]
+        member_addresses = membership_candidates or [bind_address]
+        for outbound_address in outbound_addresses:
+            for member_address in member_addresses:
+                combo = (bind_address, outbound_address, member_address)
+                if combo not in candidates:
+                    candidates.append(combo)
+    return candidates
+
+
+def _default_multicast_ttl() -> int:
+    """Default multicast TTL for the current host namespace.
+
+    Unreal defaults to TTL 0 for same-host discovery. WSL and Windows are not
+    the same network namespace, even when mirrored networking makes loopback
+    ports visible across the boundary, so WSL needs TTL 1 by default.
+    """
+    return 1 if _is_wsl() else 0
+
+
+def _default_multicast_bind_candidates(multicast_host: str) -> list[str]:
+    """Return default UDP bind candidates for UE discovery.
+
+    On WSL mirrored networking, a Windows process bound to 127.0.0.1:6766 can
+    make Linux wildcard binds fail with EADDRINUSE. Binding the socket to the
+    multicast group address avoids that local loopback collision while still
+    allowing membership on the routed WSL interface.
+    """
+    candidates = ['0.0.0.0']
+    if _is_wsl():
+        candidates.append(multicast_host)
+    return _dedupe_addresses(candidates)
+
+
+def _default_multicast_interface_candidates(multicast_host: str) -> list[str]:
+    if not _is_wsl():
+        return []
+    return _dedupe_addresses([
+        _local_ipv4_for_remote(multicast_host),
+        '0.0.0.0',
+    ])
+
+
+def _default_multicast_membership_candidates(multicast_host: str) -> list[str]:
+    if not _is_wsl():
+        return []
+    return _dedupe_addresses([
+        _local_ipv4_for_remote(multicast_host),
+        '0.0.0.0',
+    ])
+
+
 MULTICAST_GROUP = (os.environ.get('UE_MULTICAST_GROUP', '239.0.0.1'), _int_env('UE_MULTICAST_PORT', 6766))
-MULTICAST_BIND_ADDRESS = os.environ.get('UE_MULTICAST_BIND', '0.0.0.0')
+MULTICAST_BIND_CANDIDATES = _split_address_list(
+    os.environ.get('UE_MULTICAST_BIND'),
+    _default_multicast_bind_candidates(MULTICAST_GROUP[0]),
+)
+MULTICAST_INTERFACE_CANDIDATES = _split_address_list(
+    os.environ.get('UE_MULTICAST_INTERFACE'),
+    _default_multicast_interface_candidates(MULTICAST_GROUP[0]),
+)
+MULTICAST_MEMBERSHIP_CANDIDATES = _split_address_list(
+    os.environ.get('UE_MULTICAST_MEMBERSHIP'),
+    _default_multicast_membership_candidates(MULTICAST_GROUP[0]),
+)
+MULTICAST_TTL = _int_env('UE_MULTICAST_TTL', _default_multicast_ttl())
 COMMAND_ENDPOINT = (os.environ.get('UE_COMMAND_HOST', '0.0.0.0'), _int_env('UE_COMMAND_PORT', 6777))
 COMMAND_PORT_STRICT = _bool_env('UE_COMMAND_PORT_STRICT', False)
+CALLBACK_HOST = os.environ.get('UE_CALLBACK_HOST', '').strip() or None
+WINDOWS_BRIDGE_ENABLED = _bool_env('UE_WINDOWS_BRIDGE', True)
+WINDOWS_BRIDGE_DISCOVERY_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_DISCOVERY_TIMEOUT', 5)
+WINDOWS_BRIDGE_EXEC_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_EXEC_TIMEOUT', 120)
 
 _MCP_RESULT_SENTINEL = '__MCP_RESULT__'
 
@@ -63,10 +691,6 @@ class UEConnectionError(Exception):
     """Raised when a connection attempt to Unreal Editor fails."""
 
 
-class UETimeoutError(Exception):
-    """Raised when an operation times out waiting for Unreal Editor."""
-
-
 def is_local_bind_error(error: BaseException) -> bool:
     """Return True only for a local TCP listen/bind port collision."""
     if isinstance(error, OSError) and error.errno == errno.EADDRINUSE:
@@ -79,25 +703,6 @@ def is_local_bind_error(error: BaseException) -> bool:
 
 def should_attempt_command_port_fallback(error: BaseException, strict: bool) -> bool:
     return not strict and is_local_bind_error(error)
-
-
-def _callback_host_for(listen_host: str) -> str:
-    if listen_host in ('', '0.0.0.0'):
-        return '127.0.0.1'
-    if listen_host == '::':
-        return '::1'
-    return listen_host
-
-
-def allocate_fallback_command_endpoint(configured_endpoint: tuple[str, int]) -> tuple[str, int]:
-    """Reserve and release an ephemeral port on the configured listen host."""
-    host = configured_endpoint[0]
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind((host, 0))
-        return host, int(sock.getsockname()[1])
-    finally:
-        sock.close()
 
 
 class _Message:
@@ -186,10 +791,17 @@ class UEConnection:
         strict_command_port: Optional[bool] = None,
         fallback_used: bool = False,
         fallback_reason: Optional[str] = None,
+        multicast_group: Optional[tuple[str, int]] = None,
+        multicast_bind_candidates: Optional[list[str]] = None,
+        multicast_interface_candidates: Optional[list[str]] = None,
+        multicast_membership_candidates: Optional[list[str]] = None,
+        multicast_ttl: Optional[int] = None,
+        callback_host: Optional[str] = None,
     ):
         self._node_id = str(uuid.uuid4())
         self._nodes = _NodeSet()
         self._broadcast_socket: Optional[socket.socket] = None
+        self._broadcast_sockets: list[socket.socket] = []
         self._listen_thread: Optional[threading.Thread] = None
         self._running = False
         self._last_ping: Optional[float] = None
@@ -202,6 +814,29 @@ class UEConnection:
         self._strict_command_port = COMMAND_PORT_STRICT if strict_command_port is None else strict_command_port
         self._fallback_used = fallback_used
         self._fallback_reason = fallback_reason
+        self._multicast_group = multicast_group or MULTICAST_GROUP
+        self._multicast_bind_candidates = list(multicast_bind_candidates or MULTICAST_BIND_CANDIDATES)
+        self._multicast_interface_candidates = list(multicast_interface_candidates or MULTICAST_INTERFACE_CANDIDATES)
+        self._multicast_membership_candidates = list(multicast_membership_candidates or MULTICAST_MEMBERSHIP_CANDIDATES)
+        self._multicast_ttl = MULTICAST_TTL if multicast_ttl is None else multicast_ttl
+        self._callback_host_override = CALLBACK_HOST if callback_host is None else callback_host
+        self._active_multicast_bind_address: Optional[str] = None
+        self._active_multicast_interface_address: Optional[str] = None
+        self._active_multicast_membership_address: Optional[str] = None
+        self._active_multicast_sockets: list[dict[str, str]] = []
+        self._discovery_socket_attempts: list[dict[str, Any]] = []
+        self._last_discovery_error: Optional[str] = None
+        self._pong_events: list[dict[str, Any]] = []
+        self._packet_parse_errors: list[dict[str, Any]] = []
+        self._last_ping_sent_at: Optional[float] = None
+        self._last_ping_error: Optional[str] = None
+        self._last_udp_send_attempts: list[dict[str, Any]] = []
+        self._last_ping_send_attempts: list[dict[str, Any]] = []
+        self._last_callback_request: Optional[dict[str, Any]] = None
+        self._windows_bridge_node_ids: set[str] = set()
+        self._windows_bridge_nodes: list[dict[str, Any]] = []
+        self._windows_bridge_connected = False
+        self._last_windows_bridge_result: Optional[dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Discovery
@@ -212,44 +847,107 @@ class UEConnection:
         self._running = True
         self._last_ping = None
         self._nodes = _NodeSet()
-        self._init_broadcast_socket()
+        self._pong_events = []
+        self._packet_parse_errors = []
+        self._last_ping_sent_at = None
+        self._last_ping_error = None
+        self._last_udp_send_attempts = []
+        self._last_ping_send_attempts = []
+        try:
+            self._init_broadcast_socket()
+        except Exception:
+            self._running = False
+            raise
         self._listen_thread = threading.Thread(target=self._run_broadcast_listen, daemon=True)
         self._listen_thread.start()
 
     def _init_broadcast_socket(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        if hasattr(socket, 'SO_REUSEPORT'):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        else:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((MULTICAST_BIND_ADDRESS, MULTICAST_GROUP[1]))
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 0)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(MULTICAST_BIND_ADDRESS))
-        sock.setsockopt(
-            socket.IPPROTO_IP,
-            socket.IP_ADD_MEMBERSHIP,
-            socket.inet_aton(MULTICAST_GROUP[0]) + socket.inet_aton(MULTICAST_BIND_ADDRESS),
+        self._discovery_socket_attempts = []
+        self._broadcast_socket = None
+        self._broadcast_sockets = []
+        self._active_multicast_sockets = []
+        self._active_multicast_bind_address = None
+        self._active_multicast_interface_address = None
+        self._active_multicast_membership_address = None
+        for bind_address, interface_address, membership_address in _multicast_socket_candidates(
+            self._multicast_bind_candidates,
+            self._multicast_interface_candidates,
+            self._multicast_membership_candidates,
+        ):
+            attempt = {
+                'bind_address': bind_address,
+                'interface_address': interface_address,
+                'membership_address': membership_address,
+                'success': False,
+            }
+            sock: Optional[socket.socket] = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, 'SO_REUSEPORT'):
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                    except OSError:
+                        pass
+                sock.bind((bind_address, self._multicast_group[1]))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, self._multicast_ttl)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(interface_address))
+                sock.setsockopt(
+                    socket.IPPROTO_IP,
+                    socket.IP_ADD_MEMBERSHIP,
+                    socket.inet_aton(self._multicast_group[0]) + socket.inet_aton(membership_address),
+                )
+                sock.settimeout(0.1)
+                self._last_discovery_error = None
+                attempt['success'] = True
+                self._discovery_socket_attempts.append(attempt)
+                self._broadcast_sockets.append(sock)
+                self._active_multicast_sockets.append({
+                    'bind_address': bind_address,
+                    'interface_address': interface_address,
+                    'membership_address': membership_address,
+                })
+                # Keep the first socket in the legacy singular attribute for
+                # compatibility, but send/receive on every active socket.
+                if self._broadcast_socket is None:
+                    self._broadcast_socket = sock
+                    self._active_multicast_bind_address = bind_address
+                    self._active_multicast_interface_address = interface_address
+                    self._active_multicast_membership_address = membership_address
+            except (OSError, ValueError) as e:
+                attempt['error'] = f'{type(e).__name__}: {e}'
+                self._last_discovery_error = attempt['error']
+                self._discovery_socket_attempts.append(attempt)
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        if self._broadcast_sockets:
+            return
+        raise UEConnectionError(
+            'Failed to open UE Python remote-execution UDP multicast socket. '
+            f'Attempts: {self._discovery_socket_attempts}'
         )
-        sock.settimeout(0.1)
-        self._broadcast_socket = sock
 
     def _run_broadcast_listen(self) -> None:
         while self._running:
-            while True:
-                try:
-                    data = b''
-                    while True:
-                        part = self._broadcast_socket.recv(_DEFAULT_RECEIVE_BUFFER_SIZE)
-                        data += part
-                        if len(part) < _DEFAULT_RECEIVE_BUFFER_SIZE:
-                            break
-                except socket.timeout:
-                    data = None
-                if data:
-                    self._handle_broadcast_data(data)
-                else:
-                    break
+            for sock in list(self._broadcast_sockets):
+                while True:
+                    try:
+                        data, source_address = sock.recvfrom(_DEFAULT_RECEIVE_BUFFER_SIZE)
+                    except socket.timeout:
+                        data = None
+                        source_address = None
+                    except OSError as e:
+                        self._last_discovery_error = f'{type(e).__name__}: {e}'
+                        data = None
+                        source_address = None
+                    if data:
+                        self._handle_broadcast_data(data, source_address)
+                    else:
+                        break
             now = time.time()
             self._broadcast_ping(now)
             self._nodes.timeout()
@@ -258,27 +956,429 @@ class UEConnection:
     def _broadcast_ping(self, now: float) -> None:
         if not self._last_ping or (self._last_ping + _NODE_PING_SECONDS) < now:
             self._last_ping = now
-            self._send_broadcast(_Message(_TYPE_PING, self._node_id))
+            try:
+                self._send_broadcast(_Message(_TYPE_PING, self._node_id))
+                self._last_ping_sent_at = now
+                self._last_ping_error = None
+            except OSError as e:
+                self._last_ping_error = f'{type(e).__name__}: {e}'
+                raise
 
     def _send_broadcast(self, msg: _Message) -> None:
-        if self._broadcast_socket:
-            self._broadcast_socket.sendto(msg.to_json_bytes(), MULTICAST_GROUP)
+        sockets = list(self._broadcast_sockets)
+        if not sockets and self._broadcast_socket:
+            sockets = [self._broadcast_socket]
+        errors: list[str] = []
+        attempts: list[dict[str, Any]] = []
+        payload = msg.to_json_bytes()
+        for index, sock in enumerate(sockets):
+            socket_config = (
+                self._active_multicast_sockets[index]
+                if index < len(self._active_multicast_sockets)
+                else None
+            )
+            attempt = {
+                'socket_index': index,
+                'socket_config': socket_config,
+                'multicast_group': list(self._multicast_group),
+                'message_type': msg.type_,
+                'success': False,
+            }
+            try:
+                sock.sendto(payload, self._multicast_group)
+                attempt['success'] = True
+            except OSError as e:
+                error = f'{type(e).__name__}: {e}'
+                attempt['error'] = error
+                errors.append(error)
+            attempts.append(attempt)
+        self._last_udp_send_attempts = attempts
+        if msg.type_ == _TYPE_PING:
+            self._last_ping_send_attempts = attempts
+        if errors and len(errors) == len(sockets):
+            raise OSError('; '.join(errors))
+        if errors:
+            self._last_discovery_error = (
+                f'Partial UDP send failure: {len(errors)}/{len(sockets)} sockets failed'
+            )
+        elif attempts and self._last_discovery_error and self._last_discovery_error.startswith('Partial UDP send failure:'):
+            self._last_discovery_error = None
 
-    def _handle_broadcast_data(self, data: bytes) -> None:
+    def _handle_broadcast_data(self, data: bytes, source_address: Optional[tuple[str, int]] = None) -> None:
         msg = _Message(None, None)
-        if msg.from_json_bytes(data):
-            if not msg.passes_receive_filter(self._node_id):
-                return
-            if msg.type_ == _TYPE_PONG:
-                self._nodes.update(msg.source, msg.data or {})
+        if not msg.from_json_bytes(data):
+            self._packet_parse_errors.append({
+                'timestamp': time.time(),
+                'source_address': list(source_address) if source_address else None,
+                'packet_size': len(data),
+                'classification': 'PROTOCOL_VERSION_OR_MAGIC_MISMATCH',
+            })
+            self._packet_parse_errors = self._packet_parse_errors[-50:]
+            return
+        if not msg.passes_receive_filter(self._node_id):
+            return
+        if msg.type_ == _TYPE_PONG:
+            data_payload = dict(msg.data or {})
+            if source_address:
+                data_payload['_source_address'] = list(source_address)
+            self._nodes.update(msg.source, data_payload)
+            self._pong_events.append({
+                'timestamp': time.time(),
+                'node_id': msg.source,
+                'source_address': list(source_address) if source_address else None,
+                'data_keys': sorted(data_payload.keys()),
+            })
+            self._pong_events = self._pong_events[-50:]
 
     def get_remote_nodes(self) -> list:
         """Return the currently discovered remote editor nodes."""
-        return self._nodes.remote_nodes
+        nodes = self._nodes.remote_nodes
+        if nodes:
+            return nodes
+        if self._windows_bridge_supported():
+            return self._discover_windows_bridge_nodes(
+                timeout=float(WINDOWS_BRIDGE_DISCOVERY_TIMEOUT),
+            )
+        return nodes
+
+    def _windows_bridge_supported(self) -> bool:
+        """Return True when WSL can delegate UE transport to Windows Python."""
+        return bool(WINDOWS_BRIDGE_ENABLED and _is_wsl() and _find_powershell_executable())
+
+    def _run_windows_bridge(self, payload: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
+        powershell = _find_powershell_executable()
+        if not powershell:
+            return {
+                'ok': False,
+                'error': 'powershell.exe was not found; Windows bridge is unavailable.',
+            }
+
+        script_path = ''
+        payload_path = ''
+        launcher_path = ''
+        try:
+            script_path = _write_temp_text(
+                _WINDOWS_BRIDGE_SCRIPT,
+                suffix='.py',
+                prefix='ue_ikrig_mcp_bridge_',
+            )
+            payload_path = _write_temp_text(
+                json.dumps(payload, ensure_ascii=False),
+                suffix='.json',
+                prefix='ue_ikrig_mcp_bridge_payload_',
+            )
+            launcher_path = _write_temp_text(
+                _WINDOWS_BRIDGE_LAUNCHER_SCRIPT,
+                suffix='.ps1',
+                prefix='ue_ikrig_mcp_bridge_launcher_',
+            )
+
+            script_win = _wsl_path_to_windows(script_path)
+            payload_win = _wsl_path_to_windows(payload_path)
+            launcher_win = _wsl_path_to_windows(launcher_path)
+            completed = subprocess.run(
+                [
+                    powershell,
+                    '-NoProfile',
+                    '-ExecutionPolicy',
+                    'Bypass',
+                    '-File',
+                    launcher_win,
+                    script_win,
+                    payload_win,
+                ],
+                capture_output=True,
+                text=True,
+                errors='replace',
+                timeout=max(1.0, float(timeout)),
+            )
+        except subprocess.TimeoutExpired as e:
+            result = _windows_bridge_failure(
+                f'Windows bridge timed out after {timeout} seconds.',
+                stdout=e.stdout,
+                stderr=e.stderr,
+            )
+            self._last_windows_bridge_result = result
+            return result
+        except (OSError, subprocess.SubprocessError) as e:
+            result = _windows_bridge_failure(f'{type(e).__name__}: {e}')
+            self._last_windows_bridge_result = result
+            return result
+        finally:
+            for path in (script_path, payload_path, launcher_path):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+
+        bridge_payload: Optional[dict[str, Any]] = None
+        for line in reversed(completed.stdout.splitlines()):
+            if line.startswith(_WINDOWS_BRIDGE_RESULT_PREFIX):
+                try:
+                    bridge_payload = json.loads(line[len(_WINDOWS_BRIDGE_RESULT_PREFIX):])
+                except json.JSONDecodeError as e:
+                    bridge_payload = {
+                        'ok': False,
+                        'error': f'Failed to parse Windows bridge result JSON: {e}',
+                    }
+                break
+        if bridge_payload is None:
+            bridge_payload = {
+                'ok': False,
+                'error': 'Windows bridge did not emit a result sentinel.',
+            }
+        bridge_payload.setdefault('ok', False)
+        bridge_payload['_bridge_process'] = {
+            'returncode': completed.returncode,
+            'stdout_tail': completed.stdout[-2000:],
+            'stderr_tail': completed.stderr[-2000:],
+        }
+        if completed.returncode != 0 and bridge_payload.get('ok'):
+            bridge_payload['ok'] = False
+            bridge_payload['error'] = (
+                f'Windows bridge process exited with code {completed.returncode}.'
+            )
+        self._last_windows_bridge_result = bridge_payload
+        return bridge_payload
+
+    def _discover_windows_bridge_nodes(self, timeout: float = 2.0) -> list[dict[str, Any]]:
+        result = self._run_windows_bridge(
+            {
+                'op': 'discover',
+                'group': list(self._multicast_group),
+                'ttl': max(1, int(self._multicast_ttl)),
+                'timeout': timeout,
+            },
+            timeout=max(5.0, timeout + 3.0),
+        )
+        nodes: list[dict[str, Any]] = []
+        self._windows_bridge_node_ids = set()
+        if not result.get('ok'):
+            self._windows_bridge_nodes = []
+            return nodes
+        for node in result.get('nodes') or []:
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get('node_id')
+            if not node_id:
+                continue
+            entry = dict(node)
+            entry['_transport'] = 'windows_subprocess'
+            nodes.append(entry)
+            self._windows_bridge_node_ids.add(str(node_id))
+        self._windows_bridge_nodes = nodes
+        return nodes
+
+    def _activate_windows_bridge_node(self, node_id: Optional[str]) -> bool:
+        if node_id is None or node_id not in self._windows_bridge_node_ids:
+            return False
+        self._remote_node_id = node_id
+        self._windows_bridge_connected = True
+        return True
+
+    def _discover_and_activate_windows_bridge_node(self, node_id: Optional[str]) -> bool:
+        if node_id is None or not self._windows_bridge_supported():
+            return False
+        if node_id not in self._windows_bridge_node_ids:
+            self._discover_windows_bridge_nodes(
+                timeout=float(WINDOWS_BRIDGE_DISCOVERY_TIMEOUT),
+            )
+        return self._activate_windows_bridge_node(node_id)
 
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
+
+    def preflight_discovery(
+        self,
+        timeout: float = 2.0,
+        test_callback: bool = True,
+        callback_timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        """Run deterministic UE Remote Execution transport diagnostics.
+
+        The preflight sends the same UDP `ping` packet Unreal's Python Remote
+        Execution protocol expects. If no `pong` is observed, it stops with a
+        classified UDP discovery failure instead of blindly trying connect or
+        execute. If a `pong` is observed and `test_callback` is true, it opens
+        and immediately closes the TCP callback channel without executing Python
+        in Unreal.
+        """
+        timeout = max(0.1, float(timeout))
+        callback_timeout = max(0.1, float(callback_timeout))
+        started_at = time.time()
+        started_discovery = False
+        result: dict[str, Any] = {
+            'ok': False,
+            'phase': 'udp_discovery',
+            'classification': 'NO_PONG_RECEIVED_UNPROVEN',
+            'timeout_seconds': timeout,
+            'callback_timeout_seconds': callback_timeout,
+            'test_callback': test_callback,
+            'protocol': {
+                'version': _PROTOCOL_VERSION,
+                'magic': _PROTOCOL_MAGIC,
+                'ping_type': _TYPE_PING,
+                'pong_type': _TYPE_PONG,
+                'open_connection_type': _TYPE_OPEN_CONNECTION,
+            },
+        }
+
+        try:
+            if not self._running:
+                self.start_discovery()
+                started_discovery = True
+            # Force an immediate ping for deterministic doctor output even if
+            # the background loop already sent one recently.
+            self._last_ping = None
+            ping_window_start = time.time()
+            self._broadcast_ping(ping_window_start)
+        except UEConnectionError as e:
+            result.update({
+                'classification': 'CLIENT_UDP_BIND_FAILED',
+                'error': str(e),
+                'started_discovery': started_discovery,
+                'effective_config': self.get_status(),
+            })
+            return result
+        except OSError as e:
+            result.update({
+                'classification': 'CLIENT_UDP_BIND_FAILED',
+                'error': f'{type(e).__name__}: {e}',
+                'started_discovery': started_discovery,
+                'effective_config': self.get_status(),
+            })
+            return result
+
+        deadline = started_at + timeout
+        while time.time() < deadline:
+            fresh_pong_events = [
+                event for event in self._pong_events
+                if event.get('timestamp', 0) >= ping_window_start
+            ]
+            if fresh_pong_events:
+                break
+            time.sleep(0.05)
+
+        # Preflight is intentionally a direct UDP ping/pong diagnostic. Do not
+        # let the WSL Windows bridge mask a failed multicast path here.
+        all_nodes = self._nodes.remote_nodes
+        pong_events = [
+            event for event in self._pong_events
+            if event.get('timestamp', 0) >= ping_window_start
+        ]
+        fresh_node_ids = {
+            event.get('node_id')
+            for event in pong_events
+            if event.get('node_id')
+        }
+        nodes = [
+            node for node in all_nodes
+            if node.get('node_id') in fresh_node_ids
+        ]
+        cached_nodes = [
+            node for node in all_nodes
+            if node.get('node_id') not in fresh_node_ids
+        ]
+        parse_errors = [
+            event for event in self._packet_parse_errors
+            if event.get('timestamp', 0) >= ping_window_start
+        ]
+
+        result.update({
+            'started_discovery': started_discovery,
+            'ping_sent_at': self._last_ping_sent_at,
+            'ping_error': self._last_ping_error,
+            'pong_count': len(pong_events),
+            'pong_events': pong_events,
+            'nodes': nodes,
+            'cached_nodes': cached_nodes,
+            'packet_parse_errors': parse_errors,
+            'effective_config': self.get_status(),
+            'network': _network_diagnostics(self._multicast_group[0]),
+        })
+
+        if not nodes:
+            if parse_errors:
+                result['classification'] = 'PROTOCOL_VERSION_OR_MAGIC_MISMATCH'
+            else:
+                possible = [
+                    'UE_REMOTE_EXECUTION_DISABLED',
+                    'UE_MULTICAST_ENDPOINT_MISMATCH',
+                    'WINDOWS_FIREWALL_BLOCKED_UDP',
+                    'NO_PONG_RECEIVED_UNPROVEN',
+                ]
+                if _is_wsl():
+                    possible.insert(0, 'WSL_MULTICAST_NAMESPACE_BLOCKED')
+                    if self._multicast_ttl == 0:
+                        possible.insert(0, 'MULTICAST_TTL_SCOPE_BLOCKED')
+                result['possible_classifications'] = possible
+                result['next_action'] = (
+                    'Do not call connect_to_editor or execute_python yet. Verify Unreal Python '
+                    'Remote Execution settings, multicast endpoint/bind address, WSL/network '
+                    'namespace, and firewall until at least one pong is observed.'
+                )
+            return result
+
+        result['classification'] = 'PONG_RECEIVED'
+        result['phase'] = 'tcp_callback' if test_callback else 'udp_discovery'
+        if not test_callback:
+            result['ok'] = True
+            result['next_action'] = 'UDP discovery is healthy. Run callback preflight or connect_to_editor next.'
+            return result
+
+        node_id = nodes[0]['node_id']
+        callback_attempts = 2
+        callback_accept_timeout = max(0.1, callback_timeout / callback_attempts)
+        previous_active_endpoint = self._active_command_endpoint
+        previous_fallback_used = self._fallback_used
+        previous_fallback_reason = self._fallback_reason
+        try:
+            self._open_command_channel_with_fallback(
+                node_id,
+                accept_timeout=callback_accept_timeout,
+                attempts=callback_attempts,
+            )
+            result.update({
+                'ok': True,
+                'classification': 'PONG_RECEIVED',
+                'callback_classification': 'CALLBACK_REACHABLE',
+                'callback_request': self._last_callback_request,
+                'next_action': 'Transport preflight passed. MCP discover/connect calls may proceed.',
+            })
+        except (UEConnectionError, OSError, socket.timeout) as e:
+            result.update({
+                'ok': False,
+                'classification': 'PONG_RECEIVED_CALLBACK_UNREACHABLE',
+                'callback_error': f'{type(e).__name__}: {e}',
+                'callback_request': self._last_callback_request,
+                'next_action': (
+                    'UDP discovery is healthy, but Unreal did not reach the TCP callback listener. '
+                    'Inspect UE_CALLBACK_HOST/UE_COMMAND_HOST, callback port/firewall, and WSL reachability.'
+                ),
+            })
+        except Exception as e:
+            result.update({
+                'ok': False,
+                'classification': 'CLIENT_INTERNAL_ERROR',
+                'callback_classification': 'CLIENT_INTERNAL_ERROR',
+                'internal_error': f'{type(e).__name__}: {e}',
+                'callback_request': self._last_callback_request,
+                'next_action': (
+                    'UDP discovery is healthy, but the client failed while setting up '
+                    'the callback diagnostic. Preserve this error as a client/library bug '
+                    'instead of treating it as a firewall or Unreal reachability issue.'
+                ),
+            })
+        finally:
+            self._cleanup_command_sockets()
+            self._remote_node_id = None
+            self._active_command_endpoint = previous_active_endpoint
+            self._fallback_used = previous_fallback_used
+            self._fallback_reason = previous_fallback_reason
+        result['effective_config'] = self.get_status()
+        return result
 
     def connect(self, node_id: Optional[str] = None, timeout: float = 5.0) -> None:
         """
@@ -293,13 +1393,28 @@ class UEConnection:
             UENotRunningError: No editor nodes found within timeout.
             UEConnectionError: TCP handshake with the editor failed.
         """
-        if not self._running:
-            self.start_discovery()
-
         if self.is_connected() and (node_id is None or node_id == self._remote_node_id):
             return
         if self.is_connected():
             self._cleanup_command_sockets()
+            self._windows_bridge_connected = False
+
+        if self._windows_bridge_supported():
+            if node_id is None:
+                bridge_nodes = self.get_remote_nodes()
+                if bridge_nodes:
+                    node_id = bridge_nodes[0]['node_id']
+            elif self._discover_and_activate_windows_bridge_node(node_id):
+                return
+            if self._activate_windows_bridge_node(node_id):
+                return
+
+        if not self._running:
+            try:
+                self.start_discovery()
+            except UEConnectionError:
+                if not self._windows_bridge_supported():
+                    raise
 
         # Resolve target node
         if node_id is None:
@@ -314,16 +1429,34 @@ class UEConnection:
                 raise UENotRunningError('No Unreal Editor instances discovered within timeout.')
 
         self._remote_node_id = node_id
+        if self._activate_windows_bridge_node(node_id):
+            return
+        if self._discover_and_activate_windows_bridge_node(node_id):
+            return
 
+        self._open_command_channel_with_fallback(node_id)
+
+    def _open_command_channel_with_fallback(
+        self,
+        node_id: str,
+        *,
+        accept_timeout: float = 5.0,
+        attempts: int = 6,
+    ) -> None:
         try:
-            self._open_command_channel(node_id, self._active_command_endpoint)
+            self._open_command_channel(
+                node_id,
+                self._active_command_endpoint,
+                accept_timeout=accept_timeout,
+                attempts=attempts,
+            )
             return
         except OSError as e:
             self._cleanup_command_sockets()
             if not should_attempt_command_port_fallback(e, self._strict_command_port):
                 raise UEConnectionError(self._format_connect_error('TCP command listener failed', e)) from e
 
-        fallback_endpoint = allocate_fallback_command_endpoint(self._configured_command_endpoint)
+        fallback_endpoint = (self._configured_command_endpoint[0], 0)
         self._active_command_endpoint = fallback_endpoint
         self._fallback_used = True
         self._fallback_reason = (
@@ -332,13 +1465,25 @@ class UEConnection:
             f'was unavailable (EADDRINUSE)'
         )
         try:
-            self._open_command_channel(node_id, fallback_endpoint)
+            self._open_command_channel(
+                node_id,
+                fallback_endpoint,
+                accept_timeout=accept_timeout,
+                attempts=attempts,
+            )
             return
-        except Exception as e:
+        except (UEConnectionError, OSError) as e:
             self._cleanup_command_sockets()
             raise UEConnectionError(self._format_connect_error('TCP command fallback endpoint failed', e)) from e
 
-    def _open_command_channel(self, node_id: str, endpoint: tuple[str, int]) -> None:
+    def _open_command_channel(
+        self,
+        node_id: str,
+        endpoint: tuple[str, int],
+        *,
+        accept_timeout: float = 5.0,
+        attempts: int = 6,
+    ) -> None:
         listen_host, listen_port = endpoint
         self._cleanup_command_sockets()
 
@@ -349,13 +1494,21 @@ class UEConnection:
         try:
             self._command_listen_socket.bind((listen_host, listen_port))
             self._command_listen_socket.listen(1)
-            self._command_listen_socket.settimeout(5)
+            self._command_listen_socket.settimeout(accept_timeout)
+            actual_port = int(self._command_listen_socket.getsockname()[1])
+            self._active_command_endpoint = (listen_host, actual_port)
 
-            callback_ip = _callback_host_for(listen_host)
-            for _ in range(6):
+            callback_ip = self._resolve_callback_host(listen_host)
+            self._last_callback_request = {
+                'command_ip': callback_ip,
+                'command_port': actual_port,
+                'listen_host': listen_host,
+                'node_id': node_id,
+            }
+            for _ in range(attempts):
                 self._send_broadcast(_Message(_TYPE_OPEN_CONNECTION, self._node_id, node_id, {
                     'command_ip': callback_ip,
-                    'command_port': listen_port,
+                    'command_port': actual_port,
                 }))
                 try:
                     self._command_channel_socket = self._command_listen_socket.accept()[0]
@@ -369,6 +1522,13 @@ class UEConnection:
 
         self._cleanup_command_sockets()
         raise UEConnectionError('Unreal Editor did not connect back within timeout.')
+
+    def _resolve_callback_host(self, listen_host: str) -> str:
+        return _callback_host_for(
+            listen_host,
+            explicit_host=self._callback_host_override,
+            wsl_local_ip=_infer_wsl_callback_ipv4(self._multicast_group[0]),
+        )
 
     def _format_connect_error(self, prefix: str, error: BaseException) -> str:
         status = self.get_status()
@@ -401,6 +1561,25 @@ class UEConnection:
         if not self.is_connected():
             raise UEConnectionError('Not connected to Unreal Editor. Call connect() first.')
 
+        if self._windows_bridge_connected:
+            result = self._run_windows_bridge(
+                {
+                    'op': 'execute',
+                    'group': list(self._multicast_group),
+                    'ttl': max(1, int(self._multicast_ttl)),
+                    'node_id': self._remote_node_id,
+                    'code': code,
+                    'mode': mode,
+                    'timeout': WINDOWS_BRIDGE_EXEC_TIMEOUT,
+                },
+                timeout=float(WINDOWS_BRIDGE_EXEC_TIMEOUT) + 5.0,
+            )
+            if not result.get('ok'):
+                raise UEConnectionError(
+                    f'Windows bridge command execution failed: {result.get("error", "unknown error")}'
+                )
+            return _normalize_command_result(result.get('result') or {})
+
         msg = _Message(_TYPE_COMMAND, self._node_id, self._remote_node_id, {
             'command': code,
             'unattended': True,
@@ -430,27 +1609,7 @@ class UEConnection:
             raise UEConnectionError('Unexpected response type from Unreal Editor.')
 
         result_data = response.data or {}
-        success = bool(result_data.get('success', False))
-        result_str = str(result_data.get('result', ''))
-        output_str = str(result_data.get('output', ''))
-
-        # Parse __MCP_RESULT__ sentinel
-        parsed = None
-        combined = output_str + result_str
-        sentinel_idx = combined.find(_MCP_RESULT_SENTINEL)
-        if sentinel_idx != -1:
-            json_str = combined[sentinel_idx + len(_MCP_RESULT_SENTINEL):].strip()
-            try:
-                parsed = json.loads(json_str)
-            except json.JSONDecodeError:
-                logger.debug('Failed to parse MCP result JSON: %s', json_str[:200])
-
-        return {
-            'success': success,
-            'result': result_str,
-            'output': output_str,
-            'parsed': parsed,
-        }
+        return _normalize_command_result(result_data)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -458,7 +1617,11 @@ class UEConnection:
 
     def disconnect(self) -> None:
         """Close the command connection and stop discovery."""
-        if self._remote_node_id and self._broadcast_socket:
+        if (
+            self._remote_node_id
+            and not self._windows_bridge_connected
+            and (self._broadcast_socket or self._broadcast_sockets)
+        ):
             try:
                 self._send_broadcast(_Message(_TYPE_CLOSE_CONNECTION, self._node_id, self._remote_node_id))
             except Exception:
@@ -468,16 +1631,20 @@ class UEConnection:
         if self._listen_thread:
             self._listen_thread.join(timeout=2.0)
             self._listen_thread = None
-        if self._broadcast_socket:
+        for sock in list(self._broadcast_sockets):
             try:
-                self._broadcast_socket.close()
+                sock.close()
             except Exception:
                 pass
-            self._broadcast_socket = None
+        self._broadcast_sockets = []
+        self._broadcast_socket = None
         self._remote_node_id = None
         self._active_command_endpoint = self._configured_command_endpoint
         self._fallback_used = False
         self._fallback_reason = None
+        self._windows_bridge_connected = False
+        self._windows_bridge_node_ids = set()
+        self._windows_bridge_nodes = []
 
     def _cleanup_command_sockets(self) -> None:
         if self._command_channel_socket:
@@ -495,7 +1662,7 @@ class UEConnection:
 
     def is_connected(self) -> bool:
         """Return True if a TCP command channel is open."""
-        return self._command_channel_socket is not None
+        return self._windows_bridge_connected or self._command_channel_socket is not None
 
     def get_connected_node_id(self) -> Optional[str]:
         """Return the node ID of the currently connected editor, or None."""
@@ -503,6 +1670,11 @@ class UEConnection:
 
     def get_status(self) -> dict[str, Any]:
         """Return connection state plus configured/active command endpoint diagnostics."""
+        wsl_detected = _is_wsl()
+        wsl_local_ipv4 = _infer_wsl_callback_ipv4(
+            self._multicast_group[0],
+            is_wsl=wsl_detected,
+        )
         status = {
             'connected': self.is_connected(),
             'node_id': self.get_connected_node_id(),
@@ -512,6 +1684,57 @@ class UEConnection:
         }
         if self._fallback_reason:
             status['fallback_reason'] = self._fallback_reason
+        status['discovery'] = {
+            'multicast_group': list(self._multicast_group),
+            'multicast_ttl': self._multicast_ttl,
+            'bind_candidates': list(self._multicast_bind_candidates),
+            'interface_candidates': list(self._multicast_interface_candidates),
+            'membership_candidates': list(self._multicast_membership_candidates),
+            'active_bind_address': self._active_multicast_bind_address,
+            'active_interface_address': self._active_multicast_interface_address,
+            'active_membership_address': self._active_multicast_membership_address,
+            'active_socket_count': len(self._broadcast_sockets),
+            'active_sockets': list(self._active_multicast_sockets),
+            'last_error': self._last_discovery_error,
+            'socket_attempts': list(self._discovery_socket_attempts),
+            'last_ping_sent_at': self._last_ping_sent_at,
+            'last_ping_error': self._last_ping_error,
+            'last_udp_send_attempts': list(self._last_udp_send_attempts),
+            'last_ping_send_attempts': list(self._last_ping_send_attempts),
+            'pong_events': list(self._pong_events[-10:]),
+            'packet_parse_errors': list(self._packet_parse_errors[-10:]),
+        }
+        callback_config_error = _callback_host_config_error(self._callback_host_override)
+        status['callback'] = {
+            'override_host': self._callback_host_override,
+            'advertised_host': _callback_host_for(
+                self._active_command_endpoint[0],
+                explicit_host=self._callback_host_override,
+                wsl_local_ip=wsl_local_ipv4,
+            ),
+            'advertised_port': self._active_command_endpoint[1],
+            'wsl_detected': wsl_detected,
+            'wsl_local_ipv4': wsl_local_ipv4,
+            'last_callback_request': self._last_callback_request,
+        }
+        if callback_config_error:
+            status['callback']['config_error'] = callback_config_error
+        last_bridge_result = None
+        if self._last_windows_bridge_result is not None:
+            last_bridge_result = {
+                key: value
+                for key, value in self._last_windows_bridge_result.items()
+                if key not in {'traceback'}
+            }
+        status['windows_bridge'] = {
+            'enabled': WINDOWS_BRIDGE_ENABLED,
+            'supported': self._windows_bridge_supported(),
+            'connected': self._windows_bridge_connected,
+            'node_ids': sorted(self._windows_bridge_node_ids),
+            'nodes': list(self._windows_bridge_nodes),
+            'last_result': last_bridge_result,
+        }
+        status['network'] = _network_diagnostics(self._multicast_group[0])
         return status
 
 

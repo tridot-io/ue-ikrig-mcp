@@ -5,6 +5,10 @@ dist/
 build/
 .venv/
 *.egg
+
+# Local AI-agent/orchestration state (keep repo maintained from source files only)
+.agents/
+.codex/
+.claude/
 .omx/
 .omc/
-.claude/
