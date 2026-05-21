@@ -33,7 +33,10 @@ When direct WSL UDP multicast still cannot receive Unreal's `pong`, the MCP
 automatically falls back to a Windows-side Python subprocess bridge
 (`UE_WINDOWS_BRIDGE=true`, default on WSL). The bridge discovers Unreal and
 opens the command callback from Windows localhost, which avoids WSL/Windows
-multicast namespace loss while keeping the MCP server in WSL.
+multicast namespace loss while keeping the MCP server in WSL. Set
+`UE_WINDOWS_PYTHON` to a Windows Python executable such as
+`.venv-win/Scripts/python.exe` when you need the bridge to use the same
+Windows-path Python that worked in manual probes.
 
 Unreal may need a restart after plugin or network setting changes. Windows
 Defender Firewall must allow `UnrealEditor.exe`, UDP multicast on `6766`, and
@@ -123,12 +126,16 @@ The server communicates with UE Editor via the built-in Python Remote Execution 
 
 Run `preflight_discovery` before `discover_editors`/`connect_to_editor` when
 bringing up a new machine, WSL environment, or editor. It sends Unreal's exact
-Remote Execution UDP `ping` packet and waits for a `pong`. Only after a pong
-does it optionally test the TCP `open_connection` callback; it never executes
-Python in Unreal.
+Remote Execution UDP `ping` packet and waits for a `pong`. Only after a direct
+pong does it optionally test the TCP `open_connection` callback; it never
+executes Python in Unreal. On WSL, if direct Linux UDP gets no pong but the
+Windows bridge can see the editor, preflight reports
+`PONG_RECEIVED_VIA_WINDOWS_BRIDGE` and normal MCP calls proceed through the
+`windows_subprocess` transport.
 
-If `preflight_discovery` reports `NO_PONG_RECEIVED_UNPROVEN`, do **not** keep
-retrying `connect_to_editor` or `execute_python`. Fix UDP discovery first:
+If `preflight_discovery` reports `NO_PONG_RECEIVED_UNPROVEN`, neither WSL UDP
+nor the Windows bridge proved discovery. Do **not** keep retrying
+`connect_to_editor` or `execute_python`; fix discovery first:
 
 - enable Python Remote Execution in Unreal,
 - match `RemoteExecutionMulticastGroupEndpoint` with `UE_MULTICAST_GROUP` /
@@ -151,6 +158,7 @@ UE_COMMAND_HOST=0.0.0.0
 UE_COMMAND_PORT=6777
 UE_CALLBACK_HOST=172.30.1.10           # never advertise 0.0.0.0 to Unreal
 UE_WINDOWS_BRIDGE=true                 # WSL default; set false to disable
+UE_WINDOWS_PYTHON=/mnt/c/.../python.exe # explicit Windows Python for bridge
 UE_WINDOWS_BRIDGE_DISCOVERY_TIMEOUT=5  # seconds for Windows-side discovery
 UE_WINDOWS_BRIDGE_EXEC_TIMEOUT=120     # seconds for bridge command execution
 ```
@@ -165,6 +173,11 @@ listener details, and socket errors. If you need help, collect:
 - Windows Firewall status for `UnrealEditor.exe`,
 - packet evidence such as WSL `tcpdump udp port 6766` or Windows
   Wireshark/`pktmon`.
+
+`connection_status` also reports the loaded package version/source file under
+`package` and the selected bridge launcher under `windows_bridge.launcher`.
+Check these fields when `uvx` appears to be running stale code or when the
+bridge is not using the expected Windows Python.
 
 ## License
 

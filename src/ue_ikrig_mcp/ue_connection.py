@@ -11,6 +11,8 @@ import atexit
 import shutil
 import subprocess
 import tempfile
+from importlib import metadata as importlib_metadata
+from pathlib import Path
 from typing import Optional, Any
 
 # Protocol constants
@@ -27,6 +29,7 @@ _NODE_PING_SECONDS = 1
 _NODE_TIMEOUT_SECONDS = 5
 _DEFAULT_RECEIVE_BUFFER_SIZE = 8192
 _WINDOWS_BRIDGE_RESULT_PREFIX = '__UE_IKRIG_MCP_BRIDGE_RESULT__'
+_PACKAGE_NAME = 'ue-ikrig-mcp'
 
 _WINDOWS_BRIDGE_SCRIPT = r'''
 import json
@@ -509,6 +512,19 @@ def _network_diagnostics(multicast_host: str) -> dict[str, Any]:
     }
 
 
+def _package_diagnostics() -> dict[str, Any]:
+    try:
+        package_version = importlib_metadata.version(_PACKAGE_NAME)
+    except importlib_metadata.PackageNotFoundError:
+        package_version = None
+    return {
+        'name': _PACKAGE_NAME,
+        'version': package_version,
+        'source_file': __file__,
+        'executable': sys.executable,
+    }
+
+
 def _callback_host_for(
     listen_host: str,
     *,
@@ -543,6 +559,178 @@ def _find_powershell_executable() -> Optional[str]:
         return powershell
     fallback = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
     return fallback if os.path.exists(fallback) else None
+
+
+def _windows_path_to_wsl_executable_path(path: str) -> str:
+    """Return a WSL-executable path for a Windows executable path when obvious."""
+    value = path.strip().strip('"')
+    if len(value) >= 3 and value[1] == ':' and value[2] in ('\\', '/'):
+        drive = value[0].lower()
+        tail = value[3:].replace('\\', '/')
+        return f'/mnt/{drive}/{tail}'
+    return value
+
+
+def _candidate_windows_python_paths() -> list[tuple[str, str]]:
+    """Return explicit and common Windows Python candidates as (source, path)."""
+    candidates: list[tuple[str, str]] = []
+    for env_name in ('UE_WINDOWS_PYTHON', 'UE_WINDOWS_BRIDGE_PYTHON'):
+        configured = os.environ.get(env_name, '').strip()
+        if configured:
+            candidates.append((env_name, configured))
+
+    cwd = Path.cwd()
+    module_path = Path(__file__).resolve()
+    repo_candidates = [
+        cwd,
+        module_path.parents[2] if len(module_path.parents) > 2 else module_path.parent,
+    ]
+    for root in repo_candidates:
+        candidates.append(('repo .venv-win', str(root / '.venv-win' / 'Scripts' / 'python.exe')))
+
+    userprofile = os.environ.get('USERPROFILE', '').strip()
+    if userprofile:
+        candidates.append((
+            'USERPROFILE Python',
+            str(Path(_windows_path_to_wsl_executable_path(userprofile)) / 'AppData' / 'Local' / 'Python' / 'bin' / 'python.exe'),
+        ))
+
+    username = os.environ.get('USERNAME') or os.environ.get('USER')
+    if username:
+        candidates.extend([
+            (
+                'Windows user Python',
+                f'/mnt/c/Users/{username}/AppData/Local/Python/bin/python.exe',
+            ),
+            (
+                'Windows Store Python',
+                f'/mnt/c/Users/{username}/AppData/Local/Microsoft/WindowsApps/python.exe',
+            ),
+        ])
+
+    for executable in ('python.exe', 'py.exe'):
+        found = shutil.which(executable)
+        if found:
+            candidates.append((f'PATH {executable}', found))
+
+    return candidates
+
+
+def _windows_python_command(executable: str) -> list[str]:
+    """Return command argv for a Windows Python executable."""
+    command = [executable]
+    if os.path.basename(executable).lower() == 'py.exe':
+        command.append('-3')
+    return command
+
+
+def _is_explicit_windows_python_source(source: str) -> bool:
+    return source in {'UE_WINDOWS_PYTHON', 'UE_WINDOWS_BRIDGE_PYTHON'}
+
+
+def _windows_python_launcher_candidates() -> tuple[list[tuple[list[str], dict[str, Any]]], dict[str, Any]]:
+    """Return direct Windows Python launchers plus probe diagnostics."""
+    attempts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    launchers: list[tuple[list[str], dict[str, Any]]] = []
+    candidate_paths = _candidate_windows_python_paths()
+    explicit_candidates = [
+        (source, candidate)
+        for source, candidate in candidate_paths
+        if _is_explicit_windows_python_source(source)
+    ]
+    candidates_to_probe = explicit_candidates or candidate_paths
+    explicit_configured = bool(explicit_candidates)
+    for source, candidate in candidates_to_probe:
+        executable = _windows_path_to_wsl_executable_path(candidate)
+        if executable in seen:
+            continue
+        seen.add(executable)
+        explicit = _is_explicit_windows_python_source(source)
+        attempt = {
+            'source': source,
+            'configured_path': candidate,
+            'executable_path': executable,
+            'explicit': explicit,
+            'exists': os.path.exists(executable),
+        }
+        attempts.append(attempt)
+        if attempt['exists']:
+            diagnostics = {
+                'type': 'direct_python',
+                'source': source,
+                'configured_path': candidate,
+                'executable_path': executable,
+                'explicit': explicit,
+                'attempts': attempts,
+            }
+            launchers.append((_windows_python_command(executable), diagnostics))
+            if explicit:
+                return launchers, {
+                    'type': 'direct_python_candidates',
+                    'attempts': attempts,
+                    'explicit_configured': True,
+                }
+    return launchers, {
+        'type': 'direct_python_candidates',
+        'attempts': attempts,
+        'explicit_configured': explicit_configured,
+    }
+
+
+def _find_windows_python_launcher() -> tuple[Optional[list[str]], dict[str, Any]]:
+    """Find the first Windows Python executable runnable from WSL for the bridge."""
+    launchers, diagnostics = _windows_python_launcher_candidates()
+    if launchers:
+        return launchers[0]
+    return None, {
+        'type': 'direct_python',
+        'source': None,
+        'error': 'No Windows Python executable found.',
+        'attempts': diagnostics.get('attempts', []),
+    }
+
+
+def _windows_bridge_launcher_candidates() -> tuple[list[tuple[list[str], dict[str, Any]]], dict[str, Any]]:
+    """Return ordered bridge launchers and diagnostics.
+
+    Explicit Windows Python configuration is authoritative. Auto-discovered
+    Python candidates may fall through to later candidates or PowerShell if the
+    selected executable fails before the bridge script emits a sentinel.
+    """
+    candidates, python_diagnostics = _windows_python_launcher_candidates()
+    explicit_configured = bool(python_diagnostics.get('explicit_configured'))
+    if explicit_configured:
+        return candidates, {
+            'type': 'bridge_launcher_candidates',
+            'python': python_diagnostics,
+            'powershell_skipped': 'explicit Windows Python configured',
+        }
+
+    powershell = _find_powershell_executable()
+    if powershell:
+        candidates.append(([powershell], {
+            'type': 'powershell_path_lookup',
+            'source': 'powershell.exe',
+            'executable_path': powershell,
+            'python': python_diagnostics,
+        }))
+    return candidates, {
+        'type': 'bridge_launcher_candidates',
+        'python': python_diagnostics,
+        'powershell': powershell,
+    }
+
+
+def _windows_bridge_launcher() -> tuple[Optional[list[str]], dict[str, Any]]:
+    candidates, diagnostics = _windows_bridge_launcher_candidates()
+    if candidates:
+        return candidates[0]
+    return None, {
+        'type': 'unavailable',
+        'error': 'Neither Windows Python nor powershell.exe was found.',
+        'diagnostics': diagnostics,
+    }
 
 
 def _wsl_path_to_windows(path: str) -> str:
@@ -1043,19 +1231,24 @@ class UEConnection:
 
     def _windows_bridge_supported(self) -> bool:
         """Return True when WSL can delegate UE transport to Windows Python."""
-        return bool(WINDOWS_BRIDGE_ENABLED and _is_wsl() and _find_powershell_executable())
+        if not WINDOWS_BRIDGE_ENABLED or not _is_wsl():
+            return False
+        launcher, _diagnostics = _windows_bridge_launcher()
+        return bool(launcher)
 
     def _run_windows_bridge(self, payload: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
-        powershell = _find_powershell_executable()
-        if not powershell:
+        launchers, launcher_diagnostics = _windows_bridge_launcher_candidates()
+        if not launchers:
             return {
                 'ok': False,
-                'error': 'powershell.exe was not found; Windows bridge is unavailable.',
+                'error': 'Windows bridge launcher was not found.',
+                '_bridge_launcher': launcher_diagnostics,
             }
 
         script_path = ''
         payload_path = ''
         launcher_path = ''
+        launcher_failures: list[dict[str, Any]] = []
         try:
             script_path = _write_temp_text(
                 _WINDOWS_BRIDGE_SCRIPT,
@@ -1076,32 +1269,100 @@ class UEConnection:
             script_win = _wsl_path_to_windows(script_path)
             payload_win = _wsl_path_to_windows(payload_path)
             launcher_win = _wsl_path_to_windows(launcher_path)
-            completed = subprocess.run(
-                [
-                    powershell,
-                    '-NoProfile',
-                    '-ExecutionPolicy',
-                    'Bypass',
-                    '-File',
-                    launcher_win,
-                    script_win,
-                    payload_win,
-                ],
-                capture_output=True,
-                text=True,
-                errors='replace',
-                timeout=max(1.0, float(timeout)),
-            )
-        except subprocess.TimeoutExpired as e:
+
+            for launcher, current_launcher_diagnostics in launchers:
+                if current_launcher_diagnostics.get('type') == 'direct_python':
+                    command = list(launcher) + [script_win, payload_win]
+                else:
+                    command = list(launcher) + [
+                        '-NoProfile',
+                        '-ExecutionPolicy',
+                        'Bypass',
+                        '-File',
+                        launcher_win,
+                        script_win,
+                        payload_win,
+                    ]
+                try:
+                    completed = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        errors='replace',
+                        timeout=max(1.0, float(timeout)),
+                    )
+                except subprocess.TimeoutExpired as e:
+                    result = _windows_bridge_failure(
+                        f'Windows bridge timed out after {timeout} seconds.',
+                        stdout=e.stdout,
+                        stderr=e.stderr,
+                        _bridge_launcher=current_launcher_diagnostics,
+                    )
+                except (OSError, subprocess.SubprocessError) as e:
+                    result = _windows_bridge_failure(
+                        f'{type(e).__name__}: {e}',
+                        _bridge_launcher=current_launcher_diagnostics,
+                    )
+                else:
+                    bridge_payload: Optional[dict[str, Any]] = None
+                    for line in reversed(completed.stdout.splitlines()):
+                        if line.startswith(_WINDOWS_BRIDGE_RESULT_PREFIX):
+                            try:
+                                bridge_payload = json.loads(line[len(_WINDOWS_BRIDGE_RESULT_PREFIX):])
+                            except json.JSONDecodeError as e:
+                                bridge_payload = {
+                                    'ok': False,
+                                    'error': f'Failed to parse Windows bridge result JSON: {e}',
+                                }
+                            break
+                    if bridge_payload is None:
+                        bridge_payload = {
+                            'ok': False,
+                            'error': 'Windows bridge did not emit a result sentinel.',
+                        }
+                    bridge_payload.setdefault('ok', False)
+                    bridge_payload['_bridge_launcher'] = current_launcher_diagnostics
+                    bridge_payload['_bridge_process'] = {
+                        'returncode': completed.returncode,
+                        'stdout_tail': completed.stdout[-2000:],
+                        'stderr_tail': completed.stderr[-2000:],
+                    }
+                    if completed.returncode != 0 and bridge_payload.get('ok'):
+                        bridge_payload['ok'] = False
+                        bridge_payload['error'] = (
+                            f'Windows bridge process exited with code {completed.returncode}.'
+                        )
+                    result = bridge_payload
+
+                result['_bridge_launcher_failures'] = list(launcher_failures)
+                launcher_failed_before_bridge = (
+                    not result.get('ok')
+                    and (
+                        result.get('error') == 'Windows bridge did not emit a result sentinel.'
+                        or str(result.get('error', '')).startswith('Windows bridge timed out')
+                        or str(result.get('error', '')).startswith(('TimeoutExpired:', 'OSError:', 'SubprocessError:'))
+                        or result.get('_bridge_process', {}).get('returncode', 0) != 0
+                    )
+                )
+                explicit = bool(current_launcher_diagnostics.get('explicit'))
+                if launcher_failed_before_bridge and not explicit:
+                    launcher_failures.append({
+                        'source': current_launcher_diagnostics.get('source'),
+                        'type': current_launcher_diagnostics.get('type'),
+                        'error': result.get('error'),
+                        'returncode': result.get('_bridge_process', {}).get('returncode'),
+                    })
+                    continue
+
+                result['_bridge_launcher_failures'] = list(launcher_failures)
+                self._last_windows_bridge_result = result
+                return result
+
             result = _windows_bridge_failure(
-                f'Windows bridge timed out after {timeout} seconds.',
-                stdout=e.stdout,
-                stderr=e.stderr,
+                'All Windows bridge launchers failed before emitting a bridge result.',
+                _bridge_launcher=launcher_diagnostics,
+                _bridge_launcher_failures=launcher_failures,
             )
-            self._last_windows_bridge_result = result
-            return result
-        except (OSError, subprocess.SubprocessError) as e:
-            result = _windows_bridge_failure(f'{type(e).__name__}: {e}')
             self._last_windows_bridge_result = result
             return result
         finally:
@@ -1111,36 +1372,6 @@ class UEConnection:
                         os.unlink(path)
                     except OSError:
                         pass
-
-        bridge_payload: Optional[dict[str, Any]] = None
-        for line in reversed(completed.stdout.splitlines()):
-            if line.startswith(_WINDOWS_BRIDGE_RESULT_PREFIX):
-                try:
-                    bridge_payload = json.loads(line[len(_WINDOWS_BRIDGE_RESULT_PREFIX):])
-                except json.JSONDecodeError as e:
-                    bridge_payload = {
-                        'ok': False,
-                        'error': f'Failed to parse Windows bridge result JSON: {e}',
-                    }
-                break
-        if bridge_payload is None:
-            bridge_payload = {
-                'ok': False,
-                'error': 'Windows bridge did not emit a result sentinel.',
-            }
-        bridge_payload.setdefault('ok', False)
-        bridge_payload['_bridge_process'] = {
-            'returncode': completed.returncode,
-            'stdout_tail': completed.stdout[-2000:],
-            'stderr_tail': completed.stderr[-2000:],
-        }
-        if completed.returncode != 0 and bridge_payload.get('ok'):
-            bridge_payload['ok'] = False
-            bridge_payload['error'] = (
-                f'Windows bridge process exited with code {completed.returncode}.'
-            )
-        self._last_windows_bridge_result = bridge_payload
-        return bridge_payload
 
     def _discover_windows_bridge_nodes(self, timeout: float = 2.0) -> list[dict[str, Any]]:
         result = self._run_windows_bridge(
@@ -1261,8 +1492,8 @@ class UEConnection:
                 break
             time.sleep(0.05)
 
-        # Preflight is intentionally a direct UDP ping/pong diagnostic. Do not
-        # let the WSL Windows bridge mask a failed multicast path here.
+        # Keep direct UDP evidence separate from the Windows bridge retry so a
+        # bridge success does not hide the failed WSL multicast path.
         all_nodes = self._nodes.remote_nodes
         pong_events = [
             event for event in self._pong_events
@@ -1303,6 +1534,30 @@ class UEConnection:
             if parse_errors:
                 result['classification'] = 'PROTOCOL_VERSION_OR_MAGIC_MISMATCH'
             else:
+                bridge_nodes: list[dict[str, Any]] = []
+                bridge_result: Optional[dict[str, Any]] = None
+                if self._windows_bridge_supported():
+                    bridge_nodes = self._discover_windows_bridge_nodes(
+                        timeout=float(WINDOWS_BRIDGE_DISCOVERY_TIMEOUT),
+                    )
+                    bridge_result = self._last_windows_bridge_result
+                if bridge_result is not None:
+                    result['windows_bridge_result'] = bridge_result
+                if bridge_nodes:
+                    result.update({
+                        'ok': True,
+                        'classification': 'PONG_RECEIVED_VIA_WINDOWS_BRIDGE',
+                        'phase': 'windows_bridge_discovery',
+                        'nodes': bridge_nodes,
+                        'callback_classification': 'NOT_RUN_WINDOWS_BRIDGE_DISCOVERY_ONLY',
+                        'effective_config': self.get_status(),
+                        'next_action': (
+                            'Direct WSL UDP did not receive a pong, but Windows-side Python '
+                            'discovered Unreal. Use connect_to_editor/execute_python with the '
+                            'windows_subprocess transport.'
+                        ),
+                    })
+                    return result
                 possible = [
                     'UE_REMOTE_EXECUTION_DISABLED',
                     'UE_MULTICAST_ENDPOINT_MISMATCH',
@@ -1681,6 +1936,7 @@ class UEConnection:
             'configured_command_endpoint': list(self._configured_command_endpoint),
             'active_command_endpoint': list(self._active_command_endpoint),
             'fallback_used': self._fallback_used,
+            'package': _package_diagnostics(),
         }
         if self._fallback_reason:
             status['fallback_reason'] = self._fallback_reason
@@ -1726,10 +1982,12 @@ class UEConnection:
                 for key, value in self._last_windows_bridge_result.items()
                 if key not in {'traceback'}
             }
+        bridge_launcher, bridge_launcher_diagnostics = _windows_bridge_launcher()
         status['windows_bridge'] = {
             'enabled': WINDOWS_BRIDGE_ENABLED,
-            'supported': self._windows_bridge_supported(),
+            'supported': bool(WINDOWS_BRIDGE_ENABLED and wsl_detected and bridge_launcher),
             'connected': self._windows_bridge_connected,
+            'launcher': bridge_launcher_diagnostics,
             'node_ids': sorted(self._windows_bridge_node_ids),
             'nodes': list(self._windows_bridge_nodes),
             'last_result': last_bridge_result,
