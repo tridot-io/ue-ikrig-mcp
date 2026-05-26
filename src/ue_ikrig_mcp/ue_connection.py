@@ -865,6 +865,7 @@ CALLBACK_HOST = os.environ.get('UE_CALLBACK_HOST', '').strip() or None
 WINDOWS_BRIDGE_ENABLED = _bool_env('UE_WINDOWS_BRIDGE', True)
 WINDOWS_BRIDGE_DISCOVERY_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_DISCOVERY_TIMEOUT', 5)
 WINDOWS_BRIDGE_EXEC_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_EXEC_TIMEOUT', 120)
+COMMAND_EXEC_TIMEOUT = max(1, _int_env('UE_COMMAND_EXEC_TIMEOUT', WINDOWS_BRIDGE_EXEC_TIMEOUT))
 
 _MCP_RESULT_SENTINEL = '__MCP_RESULT__'
 
@@ -1840,19 +1841,34 @@ class UEConnection:
             'unattended': True,
             'exec_mode': mode,
         })
+        command_socket = self._command_channel_socket
+        command_timeout = max(0.1, float(COMMAND_EXEC_TIMEOUT))
+        previous_timeout = command_socket.gettimeout()
         try:
-            self._command_channel_socket.sendall(msg.to_json_bytes())
+            command_socket.settimeout(command_timeout)
+            command_socket.sendall(msg.to_json_bytes())
 
             # Receive full response
             data = b''
             while True:
-                part = self._command_channel_socket.recv(_DEFAULT_RECEIVE_BUFFER_SIZE)
+                part = command_socket.recv(_DEFAULT_RECEIVE_BUFFER_SIZE)
                 data += part
                 if len(part) < _DEFAULT_RECEIVE_BUFFER_SIZE:
                     break
+        except socket.timeout as e:
+            self._cleanup_command_sockets()
+            raise UEConnectionError(
+                f'Command channel timed out after {command_timeout:g} seconds waiting for Unreal Editor response.'
+            ) from e
         except OSError as e:
             self._cleanup_command_sockets()
             raise UEConnectionError(f'Command channel socket failed: {e}') from e
+        finally:
+            if self._command_channel_socket is command_socket:
+                try:
+                    command_socket.settimeout(previous_timeout)
+                except OSError:
+                    self._cleanup_command_sockets()
 
         if not data:
             raise UEConnectionError('No response received from Unreal Editor.')

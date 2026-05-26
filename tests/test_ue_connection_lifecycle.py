@@ -393,6 +393,41 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertEqual(conn.execute_payload["node_id"], "win-node")
         self.assertEqual(conn.execute_payload["mode"], "ExecuteStatement")
 
+    def test_direct_execute_uses_bounded_socket_timeout_for_stalled_editor(self):
+        class SilentCommandSocket:
+            def __init__(self):
+                self.timeout_values = []
+                self.closed = False
+
+            def gettimeout(self):
+                return None
+
+            def settimeout(self, value):
+                self.timeout_values.append(value)
+
+            def sendall(self, data):
+                self.sent = data
+
+            def recv(self, size):
+                if not self.timeout_values:
+                    raise AssertionError("recv called before configuring a timeout")
+                raise uc.socket.timeout("timed out")
+
+            def close(self):
+                self.closed = True
+
+        conn = uc.UEConnection()
+        command_socket = SilentCommandSocket()
+        conn._remote_node_id = "node-1"
+        conn._command_channel_socket = command_socket
+
+        with self.assertRaisesRegex(uc.UEConnectionError, "timed out"):
+            conn.execute("print('hi')")
+
+        self.assertGreater(command_socket.timeout_values[0], 0)
+        self.assertTrue(command_socket.closed)
+        self.assertIsNone(conn._command_channel_socket)
+
     def test_windows_python_launcher_honors_explicit_windows_path(self):
         original_env = os.environ.get("UE_WINDOWS_PYTHON")
         original_exists = uc.os.path.exists

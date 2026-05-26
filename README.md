@@ -156,6 +156,7 @@ UE_MULTICAST_MEMBERSHIP=172.30.1.10    # optional; WSL auto-detects when unset
 UE_MULTICAST_TTL=1                     # WSL default; non-WSL default is 0
 UE_COMMAND_HOST=0.0.0.0
 UE_COMMAND_PORT=6777
+UE_COMMAND_EXEC_TIMEOUT=120            # seconds for direct TCP command execution
 UE_CALLBACK_HOST=172.30.1.10           # never advertise 0.0.0.0 to Unreal
 UE_WINDOWS_BRIDGE=true                 # WSL default; set false to disable
 UE_WINDOWS_PYTHON=/mnt/c/.../python.exe # explicit Windows Python for bridge
