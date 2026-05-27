@@ -106,7 +106,7 @@ ue-ikrig-mcp
 
 ### Batch & Utility (3)
 - `batch_retarget` - Bulk retarget animations
-- `execute_python` - Raw Python escape hatch
+- `execute_python` - Raw Python escape hatch (`mode` and optional `timeout_seconds`)
 - `list_skeletal_meshes` - Find skeletal meshes
 
 ### Capture (3)
@@ -157,6 +157,7 @@ UE_MULTICAST_TTL=1                     # WSL default; non-WSL default is 0
 UE_COMMAND_HOST=0.0.0.0
 UE_COMMAND_PORT=6777
 UE_COMMAND_EXEC_TIMEOUT=120            # seconds for direct TCP command execution
+UE_CONNECTION_STATUS_TIMEOUT=0.25      # seconds for connection_status liveness probes
 UE_CALLBACK_HOST=172.30.1.10           # never advertise 0.0.0.0 to Unreal
 UE_WINDOWS_BRIDGE=true                 # WSL default; set false to disable
 UE_WINDOWS_PYTHON=/mnt/c/.../python.exe # explicit Windows Python for bridge
@@ -175,10 +176,19 @@ listener details, and socket errors. If you need help, collect:
 - packet evidence such as WSL `tcpdump udp port 6766` or Windows
   Wireshark/`pktmon`.
 
-`connection_status` also reports the loaded package version/source file under
+`connection_status` actively probes the current transport before reporting
+`connected`: direct TCP sockets are peeked for peer closure, and connected
+Windows-bridge nodes are rediscovered. The `connection_liveness` field records
+the probe result, and stale transports are cleared instead of being reported as
+connected. It also reports the loaded package version/source file under
 `package` and the selected bridge launcher under `windows_bridge.launcher`.
-Check these fields when `uvx` appears to be running stale code or when the
-bridge is not using the expected Windows Python.
+Check these fields when `uvx` appears to be running stale code, when the bridge
+is not using the expected Windows Python, or when a previously connected editor
+has disappeared.
+
+`execute_python` accepts `timeout_seconds` for per-call command bounds. When it
+is omitted, direct TCP uses `UE_COMMAND_EXEC_TIMEOUT` and the Windows bridge uses
+`UE_WINDOWS_BRIDGE_EXEC_TIMEOUT`.
 
 ## License
 

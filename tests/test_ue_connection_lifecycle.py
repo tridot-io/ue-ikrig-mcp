@@ -5,6 +5,7 @@ import types
 import unittest
 
 from ue_ikrig_mcp import ue_connection as uc
+from ue_ikrig_mcp.tools import batch as batch_tools
 from ue_ikrig_mcp.tools import connection as connection_tools
 
 
@@ -209,6 +210,68 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertEqual(status["callback"]["advertised_host"], "127.0.0.1")
         self.assertIn("wsl_detected", status["callback"])
         self.assertIn("route_ipv4_to_multicast_group", status["network"])
+
+    def test_connection_status_clears_direct_socket_when_peer_closed(self):
+        class ClosedCommandSocket:
+            def __init__(self):
+                self.closed = False
+                self.timeout_values = []
+
+            def gettimeout(self):
+                return None
+
+            def settimeout(self, value):
+                self.timeout_values.append(value)
+
+            def recv(self, size, flags=0):
+                self.peeked = (size, flags)
+                return b""
+
+            def close(self):
+                self.closed = True
+
+        conn = uc.UEConnection()
+        command_socket = ClosedCommandSocket()
+        conn._remote_node_id = "stale-node"
+        conn._command_channel_socket = command_socket
+
+        status = conn.get_status()
+
+        self.assertFalse(status["connected"])
+        self.assertIsNone(status["node_id"])
+        self.assertIsNone(conn._command_channel_socket)
+        self.assertTrue(command_socket.closed)
+        self.assertEqual(status["connection_liveness"]["transport"], "direct_tcp")
+        self.assertFalse(status["connection_liveness"]["ok"])
+
+    def test_connection_status_clears_windows_bridge_when_node_disappears(self):
+        class LostBridgeConnection(uc.UEConnection):
+            def _windows_bridge_supported(self):
+                return True
+
+            def _discover_windows_bridge_nodes(self, timeout=2.0):
+                self.discovery_timeout = timeout
+                self._last_windows_bridge_result = {
+                    "ok": False,
+                    "error": "No Unreal Editor instances discovered from Windows bridge.",
+                }
+                self._windows_bridge_node_ids = set()
+                self._windows_bridge_nodes = []
+                return []
+
+        conn = LostBridgeConnection()
+        conn._remote_node_id = "stale-node"
+        conn._windows_bridge_connected = True
+        conn._windows_bridge_node_ids = {"stale-node"}
+        conn._windows_bridge_nodes = [{"node_id": "stale-node"}]
+
+        status = conn.get_status()
+
+        self.assertFalse(status["connected"])
+        self.assertIsNone(status["node_id"])
+        self.assertFalse(status["windows_bridge"]["connected"])
+        self.assertEqual(status["connection_liveness"]["transport"], "windows_subprocess")
+        self.assertFalse(status["connection_liveness"]["ok"])
 
     def test_status_flags_wildcard_callback_host_without_advertising_it(self):
         conn = uc.UEConnection(
@@ -427,6 +490,67 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertGreater(command_socket.timeout_values[0], 0)
         self.assertTrue(command_socket.closed)
         self.assertIsNone(conn._command_channel_socket)
+
+    def test_direct_execute_honors_per_call_timeout_for_stalled_editor(self):
+        class SilentCommandSocket:
+            def __init__(self):
+                self.timeout_values = []
+
+            def gettimeout(self):
+                return None
+
+            def settimeout(self, value):
+                self.timeout_values.append(value)
+
+            def sendall(self, data):
+                self.sent = data
+
+            def recv(self, size, flags=0):
+                raise uc.socket.timeout("timed out")
+
+            def close(self):
+                self.closed = True
+
+        conn = uc.UEConnection()
+        command_socket = SilentCommandSocket()
+        conn._remote_node_id = "node-1"
+        conn._command_channel_socket = command_socket
+
+        with self.assertRaisesRegex(uc.UEConnectionError, "0.25 seconds"):
+            conn.execute("print('hi')", timeout=0.25)
+
+        self.assertIn(0.25, command_socket.timeout_values)
+
+    def test_execute_python_tool_forwards_mode_and_timeout_and_returns_transport_errors(self):
+        class TimeoutConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, code, mode="ExecuteFile", timeout=None):
+                self.calls.append((code, mode, timeout))
+                raise uc.UEConnectionError("Command channel timed out after 0.25 seconds")
+
+        fake_server = _FakeServer()
+        fake_conn = TimeoutConnection()
+        original_get_connection = batch_tools.get_connection
+        try:
+            batch_tools.get_connection = lambda: fake_conn
+            batch_tools.register(fake_server)
+
+            result = asyncio.run(
+                fake_server.tools["execute_python"](
+                    "print('hi')",
+                    mode="ExecuteStatement",
+                    timeout_seconds=0.25,
+                )
+            )
+        finally:
+            batch_tools.get_connection = original_get_connection
+
+        payload = json.loads(result[0].text)
+        self.assertEqual(fake_conn.calls, [("print('hi')", "ExecuteStatement", 0.25)])
+        self.assertTrue(payload["error"])
+        self.assertIn("timed out", payload["message"])
 
     def test_windows_python_launcher_honors_explicit_windows_path(self):
         original_env = os.environ.get("UE_WINDOWS_PYTHON")

@@ -343,6 +343,16 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _bool_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == '':
@@ -866,6 +876,7 @@ WINDOWS_BRIDGE_ENABLED = _bool_env('UE_WINDOWS_BRIDGE', True)
 WINDOWS_BRIDGE_DISCOVERY_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_DISCOVERY_TIMEOUT', 5)
 WINDOWS_BRIDGE_EXEC_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_EXEC_TIMEOUT', 120)
 COMMAND_EXEC_TIMEOUT = max(1, _int_env('UE_COMMAND_EXEC_TIMEOUT', WINDOWS_BRIDGE_EXEC_TIMEOUT))
+CONNECTION_STATUS_TIMEOUT = max(0.01, _float_env('UE_CONNECTION_STATUS_TIMEOUT', 0.25))
 
 _MCP_RESULT_SENTINEL = '__MCP_RESULT__'
 
@@ -1649,6 +1660,8 @@ class UEConnection:
             UENotRunningError: No editor nodes found within timeout.
             UEConnectionError: TCP handshake with the editor failed.
         """
+        if self.is_connected():
+            self._refresh_connection_liveness()
         if self.is_connected() and (node_id is None or node_id == self._remote_node_id):
             return
         if self.is_connected():
@@ -1799,7 +1812,7 @@ class UEConnection:
     # Command execution
     # ------------------------------------------------------------------
 
-    def execute(self, code: str, mode: str = 'ExecuteFile') -> dict:
+    def execute(self, code: str, mode: str = 'ExecuteFile', timeout: Optional[float] = None) -> dict:
         """
         Execute Python code in the connected Unreal Editor.
 
@@ -1814,10 +1827,16 @@ class UEConnection:
         Raises:
             UEConnectionError: Not connected.
         """
+        if self._command_channel_socket is not None and not self._windows_bridge_connected:
+            self._probe_direct_command_socket_liveness()
         if not self.is_connected():
             raise UEConnectionError('Not connected to Unreal Editor. Call connect() first.')
 
         if self._windows_bridge_connected:
+            command_timeout = max(
+                0.1,
+                float(WINDOWS_BRIDGE_EXEC_TIMEOUT if timeout is None else timeout),
+            )
             result = self._run_windows_bridge(
                 {
                     'op': 'execute',
@@ -1826,23 +1845,28 @@ class UEConnection:
                     'node_id': self._remote_node_id,
                     'code': code,
                     'mode': mode,
-                    'timeout': WINDOWS_BRIDGE_EXEC_TIMEOUT,
+                    'timeout': command_timeout,
                 },
-                timeout=float(WINDOWS_BRIDGE_EXEC_TIMEOUT) + 5.0,
+                timeout=command_timeout + 5.0,
             )
             if not result.get('ok'):
+                self._windows_bridge_connected = False
+                self._mark_transport_disconnected()
                 raise UEConnectionError(
                     f'Windows bridge command execution failed: {result.get("error", "unknown error")}'
-                )
+            )
             return _normalize_command_result(result.get('result') or {})
 
+        command_timeout = max(
+            0.1,
+            float(COMMAND_EXEC_TIMEOUT if timeout is None else timeout),
+        )
         msg = _Message(_TYPE_COMMAND, self._node_id, self._remote_node_id, {
             'command': code,
             'unattended': True,
             'exec_mode': mode,
         })
         command_socket = self._command_channel_socket
-        command_timeout = max(0.1, float(COMMAND_EXEC_TIMEOUT))
         previous_timeout = command_socket.gettimeout()
         try:
             command_socket.settimeout(command_timeout)
@@ -1857,11 +1881,13 @@ class UEConnection:
                     break
         except socket.timeout as e:
             self._cleanup_command_sockets()
+            self._mark_transport_disconnected()
             raise UEConnectionError(
                 f'Command channel timed out after {command_timeout:g} seconds waiting for Unreal Editor response.'
             ) from e
         except OSError as e:
             self._cleanup_command_sockets()
+            self._mark_transport_disconnected()
             raise UEConnectionError(f'Command channel socket failed: {e}') from e
         finally:
             if self._command_channel_socket is command_socket:
@@ -1869,14 +1895,21 @@ class UEConnection:
                     command_socket.settimeout(previous_timeout)
                 except OSError:
                     self._cleanup_command_sockets()
+                    self._mark_transport_disconnected()
 
         if not data:
+            self._cleanup_command_sockets()
+            self._mark_transport_disconnected()
             raise UEConnectionError('No response received from Unreal Editor.')
 
         response = _Message(None, None)
         if not response.from_json_bytes(data):
+            self._cleanup_command_sockets()
+            self._mark_transport_disconnected()
             raise UEConnectionError('Failed to parse response from Unreal Editor.')
         if not response.passes_receive_filter(self._node_id) or response.type_ != _TYPE_COMMAND_RESULT:
+            self._cleanup_command_sockets()
+            self._mark_transport_disconnected()
             raise UEConnectionError('Unexpected response type from Unreal Editor.')
 
         result_data = response.data or {}
@@ -1939,8 +1972,157 @@ class UEConnection:
         """Return the node ID of the currently connected editor, or None."""
         return self._remote_node_id if self.is_connected() else None
 
+    def _mark_transport_disconnected(self) -> None:
+        if not self._windows_bridge_connected and self._command_channel_socket is None:
+            self._remote_node_id = None
+
+    def _probe_direct_command_socket_liveness(self) -> dict[str, Any]:
+        command_socket = self._command_channel_socket
+        if command_socket is None:
+            return {
+                'transport': 'direct_tcp',
+                'ok': False,
+                'state': 'not_connected',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+
+        previous_timeout = None
+        try:
+            previous_timeout = command_socket.gettimeout()
+        except OSError as e:
+            self._cleanup_command_sockets()
+            self._mark_transport_disconnected()
+            return {
+                'transport': 'direct_tcp',
+                'ok': False,
+                'state': 'socket_error',
+                'error': f'{type(e).__name__}: {e}',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+
+        flags = getattr(socket, 'MSG_PEEK', 0) | getattr(socket, 'MSG_DONTWAIT', 0)
+        try:
+            if flags:
+                try:
+                    data = command_socket.recv(1, flags)
+                except TypeError:
+                    command_socket.settimeout(CONNECTION_STATUS_TIMEOUT)
+                    data = command_socket.recv(1)
+            else:
+                command_socket.settimeout(CONNECTION_STATUS_TIMEOUT)
+                data = command_socket.recv(1)
+        except (BlockingIOError, InterruptedError, socket.timeout):
+            return {
+                'transport': 'direct_tcp',
+                'ok': True,
+                'state': 'open_no_pending_data',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+        except OSError as e:
+            self._cleanup_command_sockets()
+            self._mark_transport_disconnected()
+            return {
+                'transport': 'direct_tcp',
+                'ok': False,
+                'state': 'socket_error',
+                'error': f'{type(e).__name__}: {e}',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+        finally:
+            if self._command_channel_socket is command_socket:
+                try:
+                    command_socket.settimeout(previous_timeout)
+                except OSError:
+                    self._cleanup_command_sockets()
+                    self._mark_transport_disconnected()
+
+        if data == b'':
+            self._cleanup_command_sockets()
+            self._mark_transport_disconnected()
+            return {
+                'transport': 'direct_tcp',
+                'ok': False,
+                'state': 'peer_closed',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+
+        return {
+            'transport': 'direct_tcp',
+            'ok': True,
+            'state': 'open_pending_data',
+            'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+        }
+
+    def _probe_windows_bridge_liveness(self) -> dict[str, Any]:
+        node_id = self._remote_node_id
+        if not self._windows_bridge_connected or not node_id:
+            self._windows_bridge_connected = False
+            self._mark_transport_disconnected()
+            return {
+                'transport': 'windows_subprocess',
+                'ok': False,
+                'state': 'not_connected',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+
+        if not self._windows_bridge_supported():
+            self._windows_bridge_connected = False
+            self._mark_transport_disconnected()
+            return {
+                'transport': 'windows_subprocess',
+                'ok': False,
+                'state': 'bridge_unavailable',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+
+        try:
+            nodes = self._discover_windows_bridge_nodes(timeout=CONNECTION_STATUS_TIMEOUT)
+        except Exception as e:
+            self._windows_bridge_connected = False
+            self._mark_transport_disconnected()
+            return {
+                'transport': 'windows_subprocess',
+                'ok': False,
+                'state': 'bridge_liveness_error',
+                'error': f'{type(e).__name__}: {e}',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+
+        if any(node.get('node_id') == node_id for node in nodes):
+            return {
+                'transport': 'windows_subprocess',
+                'ok': True,
+                'state': 'node_discovered',
+                'node_id': node_id,
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+
+        self._windows_bridge_connected = False
+        self._mark_transport_disconnected()
+        return {
+            'transport': 'windows_subprocess',
+            'ok': False,
+            'state': 'node_not_discovered',
+            'node_id': node_id,
+            'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+        }
+
+    def _refresh_connection_liveness(self) -> dict[str, Any]:
+        if self._windows_bridge_connected:
+            return self._probe_windows_bridge_liveness()
+        if self._command_channel_socket is not None:
+            return self._probe_direct_command_socket_liveness()
+        self._mark_transport_disconnected()
+        return {
+            'transport': None,
+            'ok': False,
+            'state': 'not_connected',
+            'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+        }
+
     def get_status(self) -> dict[str, Any]:
         """Return connection state plus configured/active command endpoint diagnostics."""
+        liveness = self._refresh_connection_liveness()
         wsl_detected = _is_wsl()
         wsl_local_ipv4 = _infer_wsl_callback_ipv4(
             self._multicast_group[0],
@@ -1953,6 +2135,7 @@ class UEConnection:
             'active_command_endpoint': list(self._active_command_endpoint),
             'fallback_used': self._fallback_used,
             'package': _package_diagnostics(),
+            'connection_liveness': liveness,
         }
         if self._fallback_reason:
             status['fallback_reason'] = self._fallback_reason

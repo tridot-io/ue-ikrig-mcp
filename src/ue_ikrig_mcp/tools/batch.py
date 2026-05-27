@@ -1,8 +1,9 @@
 """Batch operation tools for IK retargeting (3 tools)."""
 
 import json
+from typing import Optional
 from mcp.types import TextContent
-from ..ue_connection import get_connection, UENotRunningError
+from ..ue_connection import get_connection, UENotRunningError, UEConnectionError
 from ..ue_scripts import wrap_script, escape_string, build_asset_registry_query
 
 
@@ -93,13 +94,17 @@ def register(server):
     async def execute_python(
         code: str,
         mode: str = "ExecuteFile",
+        timeout_seconds: Optional[float] = None,
     ) -> list[TextContent]:
         try:
             conn = get_connection()
         except UENotRunningError as e:
             return _err(str(e))
 
-        result = conn.execute(code)
+        try:
+            result = conn.execute(code, mode=mode, timeout=timeout_seconds)
+        except UEConnectionError as e:
+            return _err(str(e))
         return _ok(result if result is not None else {"success": True})
 
     @server.tool(
