@@ -25,26 +25,68 @@ _SECTIONS["workflow"] = """\
 """
 
 _SECTIONS["protocol"] = """\
-## Result protocol (__MCP_RESULT__)
+## Result protocol and pre-defined helpers
 
-To return structured data, end every script with exactly one sentinel line:
+In `ExecuteFile` mode (the default), every `execute_python`/`run_script` call
+already has these defined — do **not** rewrite imports or boilerplate:
+
+| Helper | Replaces |
+|---|---|
+| `load(path)` | `unreal.load_asset` + None-guard (raises with the bad path) |
+| `mcp_result(payload)` | `print("__MCP_RESULT__" + json.dumps(payload, default=str))` |
+| `subsys(cls)` | `unreal.get_editor_subsystem(cls)` |
+| `asset_registry()` | `unreal.AssetRegistryHelpers.get_asset_registry()` |
+| `unreal`, `json` | already imported |
+
+A complete script is just the unique logic:
 
 ```python
-import json
-print("__MCP_RESULT__" + json.dumps({"success": True, "items": items}))
+mesh = load(ARGS.get("mesh", "/Game/Characters/Hero/SK_Hero"))
+mcp_result({"materials": [str(m.material_slot_name) for m in mesh.materials]})
 ```
 
-- The server parses everything after `__MCP_RESULT__` as JSON and returns it in
-  the `parsed` field. No sentinel -> `parsed` is null and you only get raw text.
-- Print the sentinel **last**, once. Earlier prints are fine; they land in
-  `output`.
-- Only JSON-serializable values: convert unreal types first, e.g.
-  `str(asset.get_path_name())`, `list(vector.to_tuple())`.
-- Report failures inside the payload (`{"success": False, "error": ...}`)
-  rather than letting an exception discard the partial result, unless the
-  failure should abort the whole script.
-- `mode` parameter: keep the default `ExecuteFile` for scripts;
-  `EvaluateStatement` is for a single expression only.
+- End every script with **one** `mcp_result(...)` call - it comes back in the
+  `parsed` field. No sentinel -> `parsed` is null and you only get raw text.
+- `mcp_result` serializes unreal types via `str()` automatically; convert
+  explicitly only when you need structure (e.g. `list(vec.to_tuple())`).
+- Report partial failures inside the payload (`{"success": False, ...}`)
+  rather than letting an exception discard partial results.
+- When `parsed` is present the raw output echo is omitted from the response
+  (compact mode); pass `compact=False` if you genuinely need stdout text.
+- `mode`: keep the default `ExecuteFile`; `EvaluateStatement` is for a single
+  expression only (helpers are not injected in statement/expression modes).
+- Helpers can be disabled with `inject_helpers=False` (e.g. for scripts using
+  `from __future__` imports, which must be the first statement).
+"""
+
+_SECTIONS["tokens"] = """\
+## Token economy
+
+Cheapest path first - each step down costs roughly 10x more tokens:
+
+1. **Dedicated tool** (~30 tokens): list_skeletal_meshes, adjust_bone_rotation,
+   capture_viewport, ... Check the tool list before writing any Python.
+2. **Batch tool** (1 call instead of N): batch_retargeter_ops collapses 12+
+   per-bone/per-chain calls into one; batch_retarget handles whole animation
+   sets. Loop server-side, never one MCP call per item.
+3. **run_script** (~40 tokens): replay a script saved earlier with
+   save_script, passing parameters via `args` (exposed as ARGS). If you have
+   written substantially the same execute_python script twice, save it now -
+   scripts persist across sessions.
+4. **execute_python** (hundreds of tokens): last resort for one-off logic.
+   Rely on the pre-defined helpers (see the protocol section) instead of
+   rewriting boilerplate, and return only the data you need via mcp_result -
+   filter and slice in UE, not in your context.
+
+Response size: results are shaped by default - structured `parsed` data
+suppresses the raw output echo, and `max_output_chars` (default 8000)
+truncates oversized text keeping head+tail. Never request unbounded listings;
+filter server-side (path prefixes, class filters, limits).
+
+API lookup: `search_unreal_api` / `describe_unreal_api` answer from a local
+catalogue - cheaper and faster than dir(unreal) dumps through the editor,
+and they prevent the costliest failure of all: a script written against a
+hallucinated API.
 """
 
 _SECTIONS["assets"] = """\
@@ -78,8 +120,34 @@ print([str(a.package_name) for a in assets])
 _SECTIONS["api"] = """\
 ## Engine API correctness
 
-- Never invent `unreal.*` names. If unsure, probe first - it costs one fast
-  call:
+- Never invent `unreal.*` names. Resolve them locally first - it costs zero
+  editor round-trips:
+  - `search_unreal_api("retarget chain offset")` - keyword search over every
+    class/method/property of this engine version (the catalogue harvests
+    itself on first search while connected; `build_api_catalog` is only
+    needed explicitly for `force=true` rebuilds).
+  - `describe_unreal_api("IKRetargeterController")` - the full docstring for
+    one symbol (live from the editor when connected).
+- UE members live on the **defining** class, so a class's own entry shows only
+  a fraction of its surface. Class describes always return the `ancestors`
+  chain; pass `include_inherited=true` to map each ancestor to the member
+  names it contributes, then describe `Base.member` for exact signatures.
+- A search miss does NOT prove the API is absent. Zero-hit queries already
+  retry with UE synonyms, substring, and typo matching (`match_mode` shows
+  which pass answered) - if matches are still empty, try the UE term for the
+  concept ('rotator' not 'rotation', 'spawn' not 'create'), rebuild the
+  catalogue if a plugin was enabled since the last harvest, and only then
+  probe live with dir(unreal).
+- The catalogue also covers **project types**: Blueprint classes, widgets,
+  user structs/enums, data assets (kinds: blueprint, widget, animbp, struct,
+  enum, dataasset). Blueprint classes are assets, never `unreal.*` attributes -
+  reach one via `load("/Game/.../BP_Foo")` or its generated class
+  `unreal.load_object(None, "/Game/.../BP_Foo.BP_Foo_C")`.
+  `describe_unreal_api("BP_Foo")` returns parent class, generated class, and
+  BP variables; BP-defined *functions* are not reflected by UE Python - call
+  them on instances, do not enumerate them. Rebuild with
+  `build_api_catalog(force=true)` after creating new project assets.
+- Only fall back to in-editor probing when the catalogue is unavailable:
 
 ```python
 print([n for n in dir(unreal) if "retarget" in n.lower()])
@@ -155,7 +223,7 @@ Diagnosis order for transport errors: `connection_status` ->
 `preflight_discovery` -> editor's Output Log (Python category).
 """
 
-_TOPICS = ("workflow", "protocol", "assets", "api", "timeouts", "errors")
+_TOPICS = ("workflow", "protocol", "tokens", "assets", "api", "timeouts", "errors")
 
 
 def register(server):

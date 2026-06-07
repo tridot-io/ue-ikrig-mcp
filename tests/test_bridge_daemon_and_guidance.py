@@ -4,14 +4,19 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
 import types
 import unittest
 
+from ue_ikrig_mcp import api_index
+from ue_ikrig_mcp import script_exec
 from ue_ikrig_mcp import ue_connection as uc
+from ue_ikrig_mcp.tools import api_catalog as api_catalog_tools
 from ue_ikrig_mcp.tools import batch as batch_tools
 from ue_ikrig_mcp.tools import guide as guide_tools
+from ue_ikrig_mcp.tools import script_store as script_store_tools
 
 
 class _FakeServer:
@@ -337,7 +342,10 @@ class ExecutePythonAutoConnectTests(unittest.TestCase):
         result = self._run_execute_python(fake_conn)
 
         self.assertEqual(fake_conn.connect_calls, 1)
-        self.assertEqual(fake_conn.execute_calls, ["print('hi')"])
+        self.assertEqual(len(fake_conn.execute_calls), 1)
+        # ExecuteFile mode injects the helper prelude ahead of the user code.
+        self.assertTrue(fake_conn.execute_calls[0].endswith("print('hi')"))
+        self.assertIn("def mcp_result", fake_conn.execute_calls[0])
         self.assertTrue(json.loads(result[0].text)["success"])
 
     def test_auto_connect_failure_reports_preflight_guidance(self):
@@ -557,6 +565,7 @@ class DaemonResponseGatingTests(unittest.TestCase):
                 self.assertEqual(daemon._pending, set())
         finally:
             writer.close()
+            daemon._proc.stdout.close()
 
     def test_prompt_reply_is_delivered_and_reclaimed(self):
         daemon, writer, sent_lines = self._make_daemon_with_pipe()
@@ -580,6 +589,611 @@ class DaemonResponseGatingTests(unittest.TestCase):
                 self.assertEqual(daemon._pending, set())
         finally:
             writer.close()
+            daemon._proc.stdout.close()
+
+
+class _CapturingConnection:
+    """Fake UEConnection capturing execute() calls and returning a canned result."""
+
+    def __init__(self, result=None):
+        self.execute_calls = []
+        self.result = result or {
+            "success": True,
+            "result": "",
+            "output": "",
+            "parsed": None,
+            "hints": [],
+        }
+
+    def is_connected(self):
+        return True
+
+    def connect(self, node_id=None, timeout=5.0):
+        pass
+
+    def execute(self, code, mode="ExecuteFile", timeout=None):
+        self.execute_calls.append((code, mode, timeout))
+        return dict(self.result)
+
+
+class PreludeInjectionTests(unittest.TestCase):
+    def _run_execute_python(self, fake_conn, code, **kwargs):
+        fake_server = _FakeServer()
+        original = batch_tools.get_connection
+        try:
+            batch_tools.get_connection = lambda: fake_conn
+            batch_tools.register(fake_server)
+            return asyncio.run(fake_server.tools["execute_python"](code, **kwargs))
+        finally:
+            batch_tools.get_connection = original
+
+    def test_execute_file_mode_gets_prelude(self):
+        conn = _CapturingConnection()
+        self._run_execute_python(conn, "mcp_result({'x': 1})")
+
+        sent_code = conn.execute_calls[0][0]
+        self.assertIn("def load(path):", sent_code)
+        self.assertIn("def mcp_result(payload):", sent_code)
+        self.assertTrue(sent_code.endswith("mcp_result({'x': 1})"))
+
+    def test_statement_mode_and_opt_out_skip_prelude(self):
+        conn = _CapturingConnection()
+        self._run_execute_python(conn, "print(1)", mode="ExecuteStatement")
+        self._run_execute_python(conn, "print(2)", inject_helpers=False)
+
+        self.assertEqual(conn.execute_calls[0][0], "print(1)")
+        self.assertEqual(conn.execute_calls[1][0], "print(2)")
+
+    def test_syntax_error_reports_user_line_numbers_unshifted(self):
+        conn = _CapturingConnection()
+        result = self._run_execute_python(conn, "x = 1\ndef broken(:\n")
+
+        payload = json.loads(result[0].text)
+        self.assertFalse(payload["success"])
+        self.assertIn("line 2", payload["result"])
+        self.assertEqual(conn.execute_calls, [])
+
+    def test_runtime_failure_gets_line_offset_hint(self):
+        conn = _CapturingConnection(result={
+            "success": False,
+            "result": 'Traceback ... File "<string>", line 22 ...',
+            "output": "",
+            "parsed": None,
+            "hints": [],
+        })
+        result = self._run_execute_python(conn, "raise ValueError('boom')")
+
+        payload = json.loads(result[0].text)
+        offset_hints = [h for h in payload["hints"] if "injected helper lines" in h]
+        self.assertEqual(len(offset_hints), 1)
+        self.assertIn(str(script_exec.PRELUDE_LINE_OFFSET), offset_hints[0])
+
+    def test_prelude_helpers_work(self):
+        import io as _io
+        import contextlib
+
+        class _FakeUnreal:
+            @staticmethod
+            def load_asset(path):
+                return {"path": path} if path.startswith("/Game/Ok") else None
+
+        namespace = {"unreal": _FakeUnreal()}
+        # Strip the real import so the stub above is used.
+        prelude = script_exec.EXECUTE_PYTHON_PRELUDE.replace("import unreal\n", "")
+        exec(prelude, namespace)
+
+        self.assertEqual(namespace["load"]("/Game/Ok/Asset"), {"path": "/Game/Ok/Asset"})
+        with self.assertRaisesRegex(ValueError, "/Game/Missing"):
+            namespace["load"]("/Game/Missing")
+
+        buffer = _io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            namespace["mcp_result"]({"obj": object()})
+        line = buffer.getvalue()
+        self.assertTrue(line.startswith("__MCP_RESULT__"))
+        json.loads(line[len("__MCP_RESULT__"):])  # str-coerced, parseable
+
+
+class ResultShapingTests(unittest.TestCase):
+    def test_compact_drops_raw_echo_when_parsed_present(self):
+        shaped = script_exec.shape_result({
+            "success": True,
+            "result": "None",
+            "output": "x" * 5000 + '__MCP_RESULT__{"ok": true}',
+            "parsed": {"ok": True},
+            "hints": [],
+        })
+
+        self.assertEqual(shaped["output"], "")
+        self.assertEqual(shaped["result"], "")
+        self.assertEqual(shaped["parsed"], {"ok": True})
+        self.assertGreater(shaped["raw_omitted"]["output_chars"], 5000)
+
+    def test_compact_keeps_output_on_failure(self):
+        big = "log spam\n" * 3000  # ~27k chars
+        shaped = script_exec.shape_result({
+            "success": False,
+            "result": "",
+            "output": big + "Traceback: the actual error",
+            "parsed": None,
+            "hints": [],
+        })
+
+        self.assertLess(len(shaped["output"]), 9000)
+        self.assertIn("[truncated", shaped["output"])
+        self.assertIn("the actual error", shaped["output"])  # tail preserved
+
+    def test_zero_limit_disables_truncation_and_compact_false_keeps_echo(self):
+        big = "y" * 20000
+        untouched = script_exec.shape_result(
+            {"success": False, "result": "", "output": big, "parsed": None},
+            max_output_chars=0,
+        )
+        self.assertEqual(untouched["output"], big)
+
+        kept = script_exec.shape_result(
+            {"success": True, "result": "r", "output": "o", "parsed": {"a": 1}},
+            compact=False,
+        )
+        self.assertEqual(kept["output"], "o")
+        self.assertNotIn("raw_omitted", kept)
+
+
+class ScriptStoreTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["UE_MCP_SCRIPT_DIR"] = self._tmp.name
+        self.fake_server = _FakeServer()
+        self.conn = _CapturingConnection()
+        script_store_tools.register(self.fake_server, connection=self.conn)
+
+    def tearDown(self):
+        os.environ.pop("UE_MCP_SCRIPT_DIR", None)
+        self._tmp.cleanup()
+
+    def _call(self, tool, *args, **kwargs):
+        return json.loads(asyncio.run(self.fake_server.tools[tool](*args, **kwargs))[0].text)
+
+    def test_save_list_run_delete_roundtrip(self):
+        saved = self._call(
+            "save_script",
+            "list-bones",
+            "mesh = load(ARGS['mesh'])\nmcp_result({'mesh': str(mesh)})",
+            description="List bones of a mesh",
+        )
+        self.assertTrue(saved["saved"])
+        self.assertFalse(saved["replaced"])
+
+        listing = self._call("list_scripts")
+        self.assertEqual(listing["scripts"][0]["name"], "list-bones")
+        self.assertEqual(listing["scripts"][0]["description"], "List bones of a mesh")
+
+        self._call("run_script", "list-bones", args={"mesh": "/Game/X"})
+        sent_code, mode, _ = self.conn.execute_calls[0]
+        self.assertEqual(mode, "ExecuteFile")
+        self.assertIn("def mcp_result", sent_code)  # prelude injected
+        self.assertIn("ARGS = __import__('json').loads", sent_code)
+        self.assertIn('"/Game/X"', sent_code.replace("\\", ""))
+        self.assertIn("mesh = load(ARGS['mesh'])", sent_code)
+        # The stored file's description header must not ship to Unreal.
+        self.assertNotIn("# description:", sent_code)
+
+        deleted = self._call("delete_script", "list-bones")
+        self.assertTrue(deleted["deleted"])
+        self.assertEqual(self._call("list_scripts")["scripts"], [])
+
+    def test_save_rejects_future_imports(self):
+        # run_script injects ARGS + prelude above the code, so a __future__
+        # import would fail at run time with a confusing editor-side error.
+        rejected = self._call(
+            "save_script", "future-script",
+            "from __future__ import annotations\nmcp_result({})",
+        )
+        self.assertTrue(rejected["error"])
+        self.assertIn("inject_helpers=False", rejected["message"])
+        self.assertEqual(self._call("list_scripts")["scripts"], [])
+
+    def test_save_rejects_bad_names_and_bad_syntax(self):
+        bad_name = self._call("save_script", "../escape", "print(1)")
+        self.assertTrue(bad_name["error"])
+
+        bad_syntax = self._call("save_script", "broken", "def broken(:")
+        self.assertFalse(bad_syntax["success"])
+        self.assertIn("SyntaxError", bad_syntax["result"])
+        self.assertEqual(self._call("list_scripts")["scripts"], [])
+
+    def test_run_unknown_script_points_at_list_scripts(self):
+        missing = self._call("run_script", "nope")
+        self.assertTrue(missing["error"])
+        self.assertIn("list_scripts", missing["message"])
+
+
+class _HarvestSimConn(_CapturingConnection):
+    """Plays the editor's role for build flows: answers the engine-version
+    probe and 'writes' the harvest file the UE-side script would produce."""
+
+    def __init__(self, engine, entries):
+        super().__init__()
+        self._engine = engine
+        self._entries = entries
+
+    def execute(self, code, mode="ExecuteFile", timeout=None):
+        self.execute_calls.append((code, mode, timeout))
+        base = {"success": True, "result": "", "output": "", "hints": []}
+        if "ARFilter" in code:  # the harvest script; the probe has no registry pass
+            tmp = api_index.catalog_path_for_version(self._engine)
+            tmp = tmp.with_name(f"_harvest_tmp_{tmp.name}")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps({
+                "engine": self._engine, "harvested_at": 1.0,
+                "entries": self._entries,
+            }), encoding="utf-8")
+            return {**base, "parsed": {"count": len(self._entries), "engine": self._engine}}
+        return {**base, "parsed": {"engine": self._engine}}
+
+
+class ApiCatalogTests(unittest.TestCase):
+    _ENGINE = "TestEngine-1.0"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["UE_MCP_CATALOG_DIR"] = self._tmp.name
+
+    def tearDown(self):
+        os.environ.pop("UE_MCP_CATALOG_DIR", None)
+        self._tmp.cleanup()
+
+    def _write_catalog(self):
+        path = api_index.catalog_path_for_version(self._ENGINE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "engine": self._ENGINE,
+            "harvested_at": 1.0,
+            "entries": [
+                {"n": "IKRetargeterController", "p": "", "k": "class",
+                 "s": "Controller for editing IK Retargeter assets", "d": ""},
+                {"n": "set_chain_settings", "p": "IKRetargeterController", "k": "method",
+                 "s": "set_chain_settings(settings, chain) -> bool",
+                 "d": "Set the settings of a retarget chain"},
+                {"n": "get_bone_transform", "p": "SkeletalMeshComponent", "k": "method",
+                 "s": "get_bone_transform(name) -> Transform", "d": "World bone transform"},
+                {"n": "StaticMesh", "p": "", "k": "class",
+                 "s": "A piece of static geometry", "d": ""},
+                # Ancestor-chain depth: members live on the defining class.
+                {"n": "SkeletalMeshComponent", "p": "", "k": "class",
+                 "s": "Renders a skeletal mesh", "d": "",
+                 "b": ["MeshComponent", "SceneComponent", "Object"]},
+                {"n": "set_material", "p": "MeshComponent", "k": "method",
+                 "s": "set_material(index, material)", "d": "Set a material"},
+                {"n": "get_world_location", "p": "SceneComponent", "k": "method",
+                 "s": "get_world_location() -> Vector", "d": ""},
+                # Project layer: 'p' is the parent class, 's' the asset path.
+                {"n": "B_SignUpViewModel", "p": "MVVMViewModelBase", "k": "widget",
+                 "s": "/Game/ViewModels/Home/B_SignUpViewModel",
+                 "d": "widget asset, parent MVVMViewModelBase"},
+                {"n": "BP_Luna", "p": "Actor", "k": "blueprint",
+                 "s": "/Game/MetaHumans/Luna/BP_Luna",
+                 "d": "blueprint asset, parent Actor"},
+            ],
+        }), encoding="utf-8")
+        return path
+
+    def _register(self, conn):
+        fake_server = _FakeServer()
+        api_catalog_tools.register(fake_server, connection=conn)
+        return fake_server
+
+    def _call(self, server, tool, *args, **kwargs):
+        return json.loads(asyncio.run(server.tools[tool](*args, **kwargs))[0].text)
+
+    def test_search_ranks_method_and_filters_by_kind(self):
+        self._write_catalog()
+        server = self._register(_CapturingConnection())
+
+        ranked = self._call(server, "search_unreal_api", "set chain settings")
+        self.assertEqual(
+            ranked["matches"][0]["symbol"],
+            "IKRetargeterController.set_chain_settings",
+        )
+
+        classes_only = self._call(server, "search_unreal_api", "retargeter", kind="class")
+        self.assertTrue(classes_only["matches"])
+        self.assertTrue(all(m["kind"] == "class" for m in classes_only["matches"]))
+
+    def test_search_recall_ladder_synonym_substring_fuzzy_and_miss_hint(self):
+        path = api_index.catalog_path_for_version(self._ENGINE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "engine": self._ENGINE, "harvested_at": 1.0,
+            "entries": [
+                {"n": "IKRetargeterController", "p": "", "k": "class",
+                 "s": "Controller for IK Retargeter assets", "d": ""},
+                {"n": "set_actor_rotation", "p": "Actor", "k": "method",
+                 "s": "set_actor_rotation(new_rotation) -> bool", "d": ""},
+            ],
+        }), encoding="utf-8")
+        server = self._register(_CapturingConnection())
+
+        # BM25 hit reports its mode.
+        direct = self._call(server, "search_unreal_api", "retargeter controller")
+        self.assertEqual(direct["match_mode"], "bm25")
+
+        # 'rotator' is UE-speak; the entry says 'rotation' - synonym pass.
+        syn = self._call(server, "search_unreal_api", "rotator")
+        self.assertEqual(syn["match_mode"], "synonyms")
+        self.assertEqual(syn["matches"][0]["symbol"], "Actor.set_actor_rotation")
+
+        # No token boundary in the query - substring pass.
+        sub = self._call(server, "search_unreal_api", "retargetercontrol")
+        self.assertEqual(sub["match_mode"], "substring")
+        self.assertEqual(sub["matches"][0]["symbol"], "IKRetargeterController")
+
+        # Typo - fuzzy pass.
+        fuzzy = self._call(server, "search_unreal_api", "retargetter controler")
+        self.assertEqual(fuzzy["match_mode"], "fuzzy")
+        self.assertEqual(fuzzy["matches"][0]["symbol"], "IKRetargeterController")
+
+        # Total miss carries an actionable hint, not a bare empty list.
+        miss = self._call(server, "search_unreal_api", "zzqq xkcd")
+        self.assertEqual(miss["match_mode"], "none")
+        self.assertEqual(miss["matches"], [])
+        self.assertIn("force=true", miss["hint"])
+
+    def test_describe_class_returns_ancestors_and_inherited_members(self):
+        self._write_catalog()
+
+        class DisconnectedConn(_CapturingConnection):
+            def is_connected(self):
+                return False
+
+        server = self._register(DisconnectedConn())
+
+        shallow = self._call(server, "describe_unreal_api", "SkeletalMeshComponent")
+        self.assertEqual(
+            shallow["ancestors"], ["MeshComponent", "SceneComponent", "Object"]
+        )
+        self.assertNotIn("inherited", shallow)
+
+        deep = self._call(
+            server, "describe_unreal_api", "SkeletalMeshComponent",
+            include_inherited=True,
+        )
+        self.assertEqual(deep["inherited"]["MeshComponent"], ["set_material"])
+        self.assertEqual(deep["inherited"]["SceneComponent"], ["get_world_location"])
+        # Own members still listed in full alongside the inherited map.
+        symbols = [e["symbol"] for e in deep["entries"]]
+        self.assertIn("SkeletalMeshComponent.get_bone_transform", symbols)
+
+    def test_search_matches_classes_by_ancestor_name(self):
+        self._write_catalog()
+        server = self._register(_CapturingConnection())
+
+        found = self._call(server, "search_unreal_api", "scene component", kind="class")
+
+        self.assertIn(
+            "SkeletalMeshComponent",
+            [m["symbol"] for m in found["matches"]],
+        )
+
+    def test_kind_filter_surfaces_rare_kinds_behind_common_tokens(self):
+        # 100 native classes share the query token; the single animbp entry
+        # ranks below all of them, so a fixed over-fetch window would miss it.
+        path = api_index.catalog_path_for_version(self._ENGINE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entries = [
+            {"n": f"AnimNode{i}", "p": "", "k": "class", "s": "anim node", "d": ""}
+            for i in range(100)
+        ]
+        entries.append({
+            "n": "ABP_Hero", "p": "AnimInstance", "k": "animbp",
+            "s": "/Game/Characters/Hero/ABP_Hero", "d": "animbp asset, parent AnimInstance",
+        })
+        path.write_text(json.dumps({
+            "engine": self._ENGINE, "harvested_at": 1.0, "entries": entries,
+        }), encoding="utf-8")
+        server = self._register(_CapturingConnection())
+
+        found = self._call(server, "search_unreal_api", "anim", limit=5, kind="animbp")
+
+        self.assertEqual([m["symbol"] for m in found["matches"]], ["ABP_Hero"])
+
+    def test_search_without_catalog_points_at_build_tool(self):
+        server = self._register(_CapturingConnection())
+        missing = self._call(server, "search_unreal_api", "anything")
+
+        self.assertTrue(missing["error"])
+        self.assertIn("build_api_catalog", missing["message"])
+
+    def test_search_auto_builds_catalog_on_first_miss(self):
+        conn = _HarvestSimConn(self._ENGINE, [
+            {"n": "IKRetargeterController", "p": "", "k": "class",
+             "s": "Controller for IK Retargeter assets", "d": ""},
+        ])
+        server = self._register(conn)
+
+        found = self._call(server, "search_unreal_api", "retargeter controller")
+
+        self.assertEqual(found["matches"][0]["symbol"], "IKRetargeterController")
+        self.assertEqual(found["auto_built"]["engine"], self._ENGINE)
+        self.assertTrue(api_index.catalog_path_for_version(self._ENGINE).exists())
+        self.assertEqual(len(conn.execute_calls), 2)  # version probe + harvest
+
+        again = self._call(server, "search_unreal_api", "retargeter controller")
+        self.assertNotIn("auto_built", again)
+        self.assertEqual(len(conn.execute_calls), 2)  # no re-harvest
+
+    def test_search_does_not_build_when_disconnected(self):
+        class DisconnectedConn(_CapturingConnection):
+            def is_connected(self):
+                return False
+
+        conn = DisconnectedConn()
+        server = self._register(conn)
+
+        missing = self._call(server, "search_unreal_api", "anything")
+
+        self.assertTrue(missing["error"])
+        self.assertEqual(conn.execute_calls, [])  # no probe, no harvest
+
+    def test_describe_auto_builds_catalog_on_first_miss(self):
+        conn = _HarvestSimConn(self._ENGINE, [
+            {"n": "IKRetargeterController", "p": "", "k": "class",
+             "s": "Controller for IK Retargeter assets", "d": ""},
+        ])
+        server = self._register(conn)
+
+        described = self._call(server, "describe_unreal_api", "IKRetargeterController")
+
+        # The fake's live getattr probe returns no doc, so the response comes
+        # from the catalogue that the miss just built.
+        self.assertEqual(described["source"], "catalog")
+        self.assertEqual(
+            described["entries"][0]["symbol"], "IKRetargeterController"
+        )
+
+    def test_harvest_and_version_scripts_compile(self):
+        compile(api_index.ENGINE_VERSION_SCRIPT, "<version>", "exec")
+        harvest = api_index.build_harvest_script("C:\\temp\\cat.json")
+        compile(harvest, "<harvest>", "exec")
+        self.assertIn("ARFilter", harvest)  # project-asset pass present
+        self.assertIn("mro", harvest)       # ancestor-chain harvest present
+        for kind in ("blueprint", "struct"):
+            compile(
+                api_index.build_asset_describe_script("/Game/X/BP_Foo", "BP_Foo", kind),
+                "<asset-describe>", "exec",
+            )
+
+    def test_search_finds_project_blueprints_and_kind_filter(self):
+        self._write_catalog()
+        server = self._register(_CapturingConnection())
+
+        ranked = self._call(server, "search_unreal_api", "signup viewmodel")
+        top = ranked["matches"][0]
+        self.assertEqual(top["symbol"], "B_SignUpViewModel")
+        self.assertEqual(top["kind"], "widget")
+        self.assertEqual(top["asset_path"], "/Game/ViewModels/Home/B_SignUpViewModel")
+        self.assertEqual(top["parent"], "MVVMViewModelBase")
+
+        bp_only = self._call(server, "search_unreal_api", "luna", kind="blueprint")
+        self.assertTrue(bp_only["matches"])
+        self.assertTrue(all(m["kind"] == "blueprint" for m in bp_only["matches"]))
+
+    def test_describe_blueprint_accepts_generated_class_suffix(self):
+        self._write_catalog()
+
+        class DisconnectedConn(_CapturingConnection):
+            def is_connected(self):
+                return False
+
+        server = self._register(DisconnectedConn())
+        described = self._call(server, "describe_unreal_api", "B_SignUpViewModel_C")
+
+        self.assertEqual(described["source"], "catalog")
+        self.assertEqual(described["entries"][0]["symbol"], "B_SignUpViewModel")
+        self.assertEqual(
+            described["entries"][0]["asset_path"],
+            "/Game/ViewModels/Home/B_SignUpViewModel",
+        )
+
+    def test_describe_project_entry_survives_member_collision_cap(self):
+        # 70 native classes define a member named 'Bar'; the blueprint asset
+        # 'Bar' must still be in the (capped-at-60) describe entries.
+        path = api_index.catalog_path_for_version(self._ENGINE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entries = [
+            {"n": "Bar", "p": f"NativeClass{i}", "k": "method", "s": "x.bar()", "d": ""}
+            for i in range(70)
+        ]
+        entries.append({
+            "n": "Bar", "p": "Actor", "k": "blueprint",
+            "s": "/Game/Stuff/Bar", "d": "blueprint asset, parent Actor",
+        })
+        path.write_text(json.dumps({
+            "engine": self._ENGINE, "harvested_at": 1.0, "entries": entries,
+        }), encoding="utf-8")
+
+        class DisconnectedConn(_CapturingConnection):
+            def is_connected(self):
+                return False
+
+        server = self._register(DisconnectedConn())
+        described = self._call(server, "describe_unreal_api", "Bar")
+
+        self.assertEqual(described["entries"][0]["asset_path"], "/Game/Stuff/Bar")
+
+    def test_describe_parent_class_does_not_dump_derived_blueprints(self):
+        # BP_Luna has parent 'Actor'; describing 'Actor' must not return it
+        # (for module entries 'p' means containing class, for project entries
+        # it means parent class - only the former is a member listing).
+        self._write_catalog()
+
+        class DisconnectedConn(_CapturingConnection):
+            def is_connected(self):
+                return False
+
+        server = self._register(DisconnectedConn())
+        described = self._call(server, "describe_unreal_api", "Actor")
+        self.assertTrue(described["error"])
+
+    def test_describe_blueprint_live_loads_asset(self):
+        self._write_catalog()
+        conn = _CapturingConnection(result={
+            "success": True, "result": "", "output": "",
+            "parsed": {
+                "asset_path": "/Game/ViewModels/Home/B_SignUpViewModel",
+                "asset_class": "WidgetBlueprint",
+                "parent_class": "MVVMViewModelBase",
+                "generated_class": "B_SignUpViewModel_C",
+            },
+            "hints": [],
+        })
+        server = self._register(conn)
+
+        described = self._call(server, "describe_unreal_api", "B_SignUpViewModel")
+
+        self.assertEqual(described["source"], "editor")
+        self.assertEqual(described["symbol"], "B_SignUpViewModel")
+        self.assertEqual(described["kind"], "widget")
+        self.assertEqual(described["generated_class"], "B_SignUpViewModel_C")
+        sent_code = conn.execute_calls[0][0]
+        self.assertIn('load_asset("/Game/ViewModels/Home/B_SignUpViewModel")', sent_code)
+        self.assertIn("B_SignUpViewModel_C", sent_code)  # generated-class probe
+
+    def test_build_skips_harvest_when_cached(self):
+        self._write_catalog()
+        conn = _CapturingConnection(result={
+            "success": True, "result": "", "output": "",
+            "parsed": {"engine": self._ENGINE}, "hints": [],
+        })
+        server = self._register(conn)
+
+        built = self._call(server, "build_api_catalog")
+
+        self.assertTrue(built["cached"])
+        self.assertFalse(built["built"])
+        self.assertEqual(built["entry_count"], 9)
+        # Only the engine-version probe ran; no harvest execution.
+        self.assertEqual(len(conn.execute_calls), 1)
+
+    def test_describe_uses_catalog_when_disconnected(self):
+        self._write_catalog()
+
+        class DisconnectedConn(_CapturingConnection):
+            def is_connected(self):
+                return False
+
+        server = self._register(DisconnectedConn())
+        described = self._call(server, "describe_unreal_api", "IKRetargeterController")
+
+        self.assertEqual(described["source"], "catalog")
+        symbols = [e["symbol"] for e in described["entries"]]
+        self.assertIn("IKRetargeterController", symbols)
+        self.assertIn("IKRetargeterController.set_chain_settings", symbols)
+
+    def test_describe_rejects_injection_shaped_symbols(self):
+        server = self._register(_CapturingConnection())
+        bad = self._call(server, "describe_unreal_api", "x'); import os #")
+        self.assertTrue(bad["error"])
 
 
 class GuideToolTests(unittest.TestCase):

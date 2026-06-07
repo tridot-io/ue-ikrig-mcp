@@ -3,8 +3,19 @@
 import json
 from typing import Optional
 from mcp.types import TextContent
-from ..ue_connection import get_connection, UENotRunningError, UEConnectionError
+from ..ue_connection import (
+    get_connection,
+    UENotRunningError,
+    UEConnectionError,
+    _script_syntax_preflight,
+)
 from ..ue_scripts import wrap_script, escape_string, build_asset_registry_query
+from ..script_exec import (
+    add_line_offset_hint,
+    ensure_connected,
+    prepare_user_code,
+    shape_result,
+)
 
 
 def _ok(data) -> list[TextContent]:
@@ -87,52 +98,60 @@ def register(server):
         name="execute_python",
         description=(
             "Execute arbitrary Python code in Unreal Engine. "
-            "Raw escape hatch for advanced operations not covered by other tools. "
-            "The code string is sent directly to UE's Python interpreter. "
-            "Auto-connects to the first discovered editor when not yet connected. "
-            "Rules for reliable scripts: "
-            "(1) to return structured data, end the script with "
-            "print('__MCP_RESULT__' + json.dumps(payload)) — it comes back in 'parsed'; "
-            "(2) asset paths are object paths like /Game/Folder/Asset (no .uasset extension, "
-            "no Content/ prefix); always guard unreal.load_asset() results against None; "
-            "(3) prefer editor subsystems (unreal.get_editor_subsystem(...)) over deprecated "
-            "EditorLevelLibrary/EditorAssetLibrary calls; "
-            "(4) scripts run synchronously on the editor game thread — never call input() or "
-            "poll with sleep loops, and pass timeout_seconds for long batch operations; "
-            "(5) syntax is checked locally before sending, and failures include actionable "
-            "'hints'. Call ue_python_guide for the full scripting guide."
+            "Raw escape hatch when no dedicated tool fits (prefer dedicated tools and "
+            "batch_retargeter_ops first; save recurring scripts with save_script and replay "
+            "them with run_script). Auto-connects when not yet connected. "
+            "In ExecuteFile mode these helpers are pre-defined for you — do NOT rewrite them: "
+            "load(path) (guarded unreal.load_asset), mcp_result(payload) (prints the "
+            "__MCP_RESULT__ sentinel, unreal types coerce via str), subsys(cls), "
+            "asset_registry(), plus json/unreal already imported. End scripts with "
+            "mcp_result(...) to return structured data in 'parsed'. "
+            "Asset paths are object paths like /Game/Folder/Asset (no .uasset, no Content/). "
+            "Scripts run synchronously on the editor game thread — never input()/sleep-poll; "
+            "pass timeout_seconds for long operations. Syntax is checked locally and failures "
+            "include 'hints'. When parsed data is returned, the raw output echo is omitted "
+            "(compact=False to keep it; max_output_chars bounds it, 0 = unlimited). "
+            "Call ue_python_guide for the full scripting guide."
         ),
     )
     async def execute_python(
         code: str,
         mode: str = "ExecuteFile",
         timeout_seconds: Optional[float] = None,
+        inject_helpers: bool = True,
+        compact: bool = True,
+        max_output_chars: int = 8000,
     ) -> list[TextContent]:
         try:
             conn = get_connection()
         except UENotRunningError as e:
             return _err(str(e))
 
+        # Preflight the user code alone so SyntaxError line numbers are not
+        # shifted by the injected prelude.
+        preflight_failure = _script_syntax_preflight(code, mode)
+        if preflight_failure is not None:
+            return _ok(preflight_failure)
+
         # Auto-connect so a fresh session's first execute_python call works
         # without an explicit connect_to_editor round-trip.
-        if (
-            hasattr(conn, "is_connected")
-            and hasattr(conn, "connect")
-            and not conn.is_connected()
-        ):
-            try:
-                conn.connect()
-            except (UENotRunningError, UEConnectionError) as e:
-                return _err(
-                    f"Auto-connect to Unreal Editor failed: {e} "
-                    "Run preflight_discovery to diagnose the transport."
-                )
+        connect_error = ensure_connected(conn)
+        if connect_error is not None:
+            return _err(connect_error)
 
         try:
-            result = conn.execute(code, mode=mode, timeout=timeout_seconds)
+            result = conn.execute(
+                prepare_user_code(code, mode, inject_helpers),
+                mode=mode,
+                timeout=timeout_seconds,
+            )
         except UEConnectionError as e:
             return _err(str(e))
-        return _ok(result if result is not None else {"success": True})
+        if result is None:
+            return _ok({"success": True})
+        if inject_helpers and mode == "ExecuteFile":
+            add_line_offset_hint(result)
+        return _ok(shape_result(result, max_output_chars=max_output_chars, compact=compact))
 
     @server.tool(
         name="list_skeletal_meshes",

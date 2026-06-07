@@ -106,9 +106,19 @@ ue-ikrig-mcp
 
 ### Batch & Utility (4)
 - `batch_retarget` - Bulk retarget animations
-- `execute_python` - Raw Python escape hatch (`mode` and optional `timeout_seconds`); auto-connects, validates syntax locally, returns failure `hints`
+- `execute_python` - Raw Python escape hatch (`mode` and optional `timeout_seconds`); auto-connects, validates syntax locally, injects helper prelude, returns failure `hints`
 - `list_skeletal_meshes` - Find skeletal meshes
-- `ue_python_guide` - Unreal Python scripting guide for MCP drivers (result protocol, asset paths, API pitfalls, timeouts)
+- `ue_python_guide` - Unreal Python scripting guide for MCP drivers (result protocol, token economy, asset paths, API pitfalls, timeouts)
+
+### Script store (4)
+- `save_script` - Persist a reusable UE Python script under a name (syntax-checked; survives sessions)
+- `run_script` - Replay a saved script with JSON parameters exposed as the `ARGS` dict
+- `list_scripts` / `delete_script` - Manage the store (`UE_MCP_SCRIPT_DIR`, default `~/.ue_ikrig_mcp/scripts`)
+
+### API catalogue (3)
+- `build_api_catalog` - One-time harvest of the editor's `unreal` Python API (classes/methods/properties with signatures and doc summaries) plus the project's own types from the asset registry (Blueprint/widget/anim-BP classes, user structs/enums, data assets - with parent class and asset path, no asset loading) into a local file keyed by engine version; runs automatically on the first search when the editor is connected, so the explicit call is mainly for `force=true` rebuilds
+- `search_unreal_api` - Instant local BM25 keyword search over the catalogue - no editor round-trip, prevents hallucinated API names; zero-hit queries cascade through UE-synonym, substring, and typo-tolerant passes (`match_mode` reports which); kind filters include `blueprint`, `widget`, `struct`, `enum`, `dataasset`
+- `describe_unreal_api` - Full docstring for one symbol (live from the editor when connected, catalogue otherwise); class responses carry the ancestor chain, and `include_inherited=true` maps each ancestor to the members it contributes (UE members live on the defining class); project Blueprint symbols resolve as assets - parent class, generated class, BP variables (`UE_MCP_CATALOG_DIR`, default `~/.ue_ikrig_mcp/api_catalog`)
 
 ### Capture (3)
 - `capture_viewport` - Level editor viewport screenshot via UE AutomationLibrary (hardened with realtime/repaint forcing)
@@ -171,6 +181,8 @@ UE_BRIDGE_NODE_CACHE_TTL=5             # seconds to cache bridge discovery resul
 UE_BRIDGE_EMPTY_CACHE_TTL=2            # seconds to cache an empty discovery result
 UE_DISCOVERY_SETTLE=0.25               # extra wait after first pong for more editors
 UE_SCRIPT_PREFLIGHT=true               # local syntax check before sending scripts to UE
+UE_MCP_SCRIPT_DIR=~/.ue_ikrig_mcp/scripts      # saved script store location
+UE_MCP_CATALOG_DIR=~/.ue_ikrig_mcp/api_catalog # unreal API catalogue location
 ```
 
 ### Windows bridge daemon (performance)
@@ -196,6 +208,25 @@ one-shot behavior.
   `hints` list that classifies common Unreal Python failures (hallucinated or
   deprecated APIs, bad asset paths, missing `__MCP_RESULT__` sentinel,
   timeouts) into actionable fixes.
+
+### Token economy for drivers
+
+Generating UE Python inline burns driver tokens; the server removes the
+recurring overhead:
+
+- **Helper prelude**: in `ExecuteFile` mode every `execute_python`/`run_script`
+  call has `load()`, `mcp_result()`, `subsys()`, `asset_registry()` and the
+  `unreal`/`json` imports pre-defined — scripts contain only unique logic
+  (`inject_helpers=false` to opt out).
+- **Saved scripts**: `save_script` once, `run_script(name, args)` forever —
+  parameters arrive as the `ARGS` dict, scripts persist on disk across
+  sessions (`UE_MCP_SCRIPT_DIR`, default `~/.ue_ikrig_mcp/scripts`).
+- **Result shaping**: when a script returns structured data via
+  `__MCP_RESULT__`, the raw output echo is omitted (`compact=false` to keep
+  it); oversized text is truncated head+tail at `max_output_chars`
+  (default 8000, `0` = unlimited).
+- The `ue_python_guide` `tokens` topic gives drivers the cheapest-path
+  ranking: dedicated tool → batch tool → `run_script` → `execute_python`.
 
 Failed preflight output includes OS/WSL detection, local IPv4 candidates, the
 route-selected local address for the multicast group, bind/interface/membership

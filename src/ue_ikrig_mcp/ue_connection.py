@@ -1003,9 +1003,8 @@ _FAILURE_HINT_PATTERNS: list[tuple['re.Pattern[str]', str]] = [
     (
         re.compile(r"AttributeError: module 'unreal' has no attribute '(\w+)'"),
         "unreal.<name> does not exist in this engine version — the API may be renamed, "
-        "deprecated, or hallucinated. Probe first: "
-        "print([n for n in dir(unreal) if 'keyword' in n.lower()]) and check this engine "
-        "version's Python API docs before retrying.",
+        "deprecated, or hallucinated. Use search_unreal_api('keyword') to find the real "
+        "name locally, or probe print([n for n in dir(unreal) if 'keyword' in n.lower()]).",
     ),
     (
         re.compile(r"'NoneType' object has no attribute"),
@@ -1015,8 +1014,9 @@ _FAILURE_HINT_PATTERNS: list[tuple['re.Pattern[str]', str]] = [
     ),
     (
         re.compile(r"AttributeError: '[^']+' object has no attribute '(\w+)'"),
-        "The object lacks that attribute/method in this engine version. Inspect it first: "
-        "print(type(obj).__name__); print([n for n in dir(obj) if not n.startswith('_')]).",
+        "The object lacks that attribute/method in this engine version. Check "
+        "search_unreal_api('<ClassName> <keyword>') or describe_unreal_api('<ClassName>'), "
+        "or inspect live: print([n for n in dir(obj) if not n.startswith('_')]).",
     ),
     (
         re.compile(r'Failed to load|Failed to find|does not exist|could not be found|not found|is not a valid', re.IGNORECASE),
