@@ -36,6 +36,7 @@ _WINDOWS_BRIDGE_SCRIPT = r'''
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -464,6 +465,28 @@ def daemon_execute(payload):
         return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
 
 
+def editor_process_check():
+    """Is an Unreal Editor process alive on this (Windows) machine?
+
+    Distinguishes 'editor busy on the game thread' (process alive, discovery
+    silent) from 'editor gone'. editor_process_alive is None when the check
+    itself was impossible (e.g. tasklist unavailable)."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq UnrealEditor*", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+        alive = "UnrealEditor" in (out.stdout or "")
+        return {"ok": True, "op": "process_check", "editor_process_alive": alive}
+    except Exception as exc:
+        return {
+            "ok": True,
+            "op": "process_check",
+            "editor_process_alive": None,
+            "error": "%s: %s" % (type(exc).__name__, exc),
+        }
+
+
 def handle_request(request):
     op = request.get("op")
     if op == "ping":
@@ -482,6 +505,8 @@ def handle_request(request):
         return discover(request)
     if op == "execute":
         return daemon_execute(request)
+    if op == "process_check":
+        return editor_process_check()
     if op == "close":
         close_all_channels()
         return {"ok": True, "op": "close"}
@@ -533,6 +558,9 @@ def main():
             return
         if op == "execute":
             emit(execute(payload))
+            return
+        if op == "process_check":
+            emit(editor_process_check())
             return
         emit({"ok": False, "error": f"Unsupported bridge operation: {op!r}"})
     except Exception as exc:
@@ -1046,6 +1074,12 @@ _TIMEOUT_GUIDANCE = (
     ' The editor may still be running the script on its game thread. For long operations '
     'pass a larger timeout_seconds, keep scripts non-interactive (no input()/sleep polling), '
     'and split very large batches into smaller calls.'
+)
+
+EDITOR_BUSY_MESSAGE = (
+    'Editor process is alive but not answering discovery - its game thread is busy '
+    '(long compile/bake or a still-running script). Wait and retry; do not restart '
+    'the editor or resend the last script.'
 )
 
 
@@ -2207,6 +2241,14 @@ class UEConnection:
                         ),
                     })
                     return result
+                # No pong anywhere. Busy editor vs absent editor changes the
+                # right next action completely - check the process.
+                editor_alive = self._editor_process_alive()
+                result['editor_process_alive'] = editor_alive
+                if editor_alive is True:
+                    result['classification'] = 'EDITOR_PROCESS_ALIVE_BUT_SILENT'
+                    result['next_action'] = EDITOR_BUSY_MESSAGE
+                    return result
                 possible = [
                     'UE_REMOTE_EXECUTION_DISABLED',
                     'UE_MULTICAST_ENDPOINT_MISMATCH',
@@ -2284,6 +2326,30 @@ class UEConnection:
         result['effective_config'] = self.get_status()
         return result
 
+    def _editor_process_alive(self) -> Optional[bool]:
+        """True/False when the Windows bridge could check for a running
+        UnrealEditor process; None when unknown (no bridge, check failed)."""
+        if not self._windows_bridge_supported():
+            return None
+        try:
+            result = self._run_windows_bridge({'op': 'process_check'}, timeout=15.0)
+        except Exception:
+            return None
+        if not isinstance(result, dict) or not result.get('ok'):
+            return None
+        alive = result.get('editor_process_alive')
+        return alive if isinstance(alive, bool) else None
+
+    def _no_nodes_error(self) -> str:
+        """Discovery found nothing - but is the editor gone, or just deaf?
+
+        UE answers discovery pings on the game thread, so a long compile,
+        bake, or script makes a healthy editor look absent. Misreporting
+        that as 'no editor' sends drivers into restart loops."""
+        if self._editor_process_alive() is True:
+            return EDITOR_BUSY_MESSAGE
+        return 'No Unreal Editor instances discovered within timeout.'
+
     def connect(self, node_id: Optional[str] = None, timeout: float = 5.0) -> None:
         """
         Connect to a discovered Unreal Editor node.
@@ -2332,7 +2398,7 @@ class UEConnection:
                     break
                 time.sleep(0.2)
             if node_id is None:
-                raise UENotRunningError('No Unreal Editor instances discovered within timeout.')
+                raise UENotRunningError(self._no_nodes_error())
 
         self._remote_node_id = node_id
         if self._activate_windows_bridge_node(node_id):

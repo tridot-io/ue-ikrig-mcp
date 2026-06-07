@@ -170,6 +170,96 @@ class BridgeNodeCacheTests(unittest.TestCase):
         self.assertEqual(conn.discover_calls, 2)
 
 
+class EditorBusyClassificationTests(unittest.TestCase):
+    """A busy game thread must read as 'editor busy', never 'no editor'."""
+
+    @staticmethod
+    def _fake_subprocess(stdout=None, raises=None):
+        class _Result:
+            def __init__(self, text):
+                self.stdout = text
+
+        class _FakeSubprocess:
+            def run(self, *args, **kwargs):
+                if raises is not None:
+                    raise raises
+                return _Result(stdout)
+
+        return _FakeSubprocess()
+
+    def test_bridge_process_check_reports_alive_dead_and_unknown(self):
+        ns = _exec_bridge_script()
+
+        ns["subprocess"] = self._fake_subprocess(
+            stdout='"UnrealEditor.exe","12345","Console","1","2,048,000 K"\n'
+        )
+        alive = ns["handle_request"]({"op": "process_check"})
+        self.assertTrue(alive["ok"])
+        self.assertIs(alive["editor_process_alive"], True)
+
+        ns["subprocess"] = self._fake_subprocess(
+            stdout="INFO: No tasks are running which match the specified criteria.\n"
+        )
+        dead = ns["handle_request"]({"op": "process_check"})
+        self.assertIs(dead["editor_process_alive"], False)
+
+        # tasklist unavailable (e.g. non-Windows): unknown, never an exception.
+        ns["subprocess"] = self._fake_subprocess(raises=FileNotFoundError("tasklist"))
+        unknown = ns["handle_request"]({"op": "process_check"})
+        self.assertTrue(unknown["ok"])
+        self.assertIsNone(unknown["editor_process_alive"])
+
+    def _make_connection(self, alive):
+        class BusyEditorConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self.process_checks = 0
+
+            def _windows_bridge_supported(self):
+                return True
+
+            def _run_windows_bridge(self, payload, timeout=10.0):
+                if payload["op"] == "discover":
+                    return {"ok": True, "nodes": []}
+                if payload["op"] == "process_check":
+                    self.process_checks += 1
+                    return {"ok": True, "editor_process_alive": alive}
+                raise AssertionError(payload)
+
+        conn = BusyEditorConnection()
+        conn._running = True  # skip real UDP discovery
+        return conn
+
+    def test_connect_reports_busy_when_process_alive_but_silent(self):
+        conn = self._make_connection(alive=True)
+
+        with self.assertRaises(uc.UENotRunningError) as ctx:
+            conn.connect(timeout=0.05)
+
+        self.assertIn("busy", str(ctx.exception))
+        self.assertIn("do not restart", str(ctx.exception))
+        self.assertEqual(conn.process_checks, 1)
+
+    def test_connect_keeps_plain_message_when_no_process(self):
+        conn = self._make_connection(alive=False)
+
+        with self.assertRaises(uc.UENotRunningError) as ctx:
+            conn.connect(timeout=0.05)
+
+        self.assertIn("No Unreal Editor instances discovered", str(ctx.exception))
+        self.assertNotIn("busy", str(ctx.exception))
+
+    def test_preflight_classifies_alive_but_silent(self):
+        conn = self._make_connection(alive=True)
+        conn._broadcast_ping = lambda *_args, **_kwargs: None  # no real UDP
+
+        result = conn.preflight_discovery(timeout=0.1, test_callback=False)
+
+        self.assertEqual(result["classification"], "EDITOR_PROCESS_ALIVE_BUT_SILENT")
+        self.assertIs(result["editor_process_alive"], True)
+        self.assertIn("busy", result["next_action"])
+
+
 class ScriptGuidanceTests(unittest.TestCase):
     def test_syntax_preflight_blocks_before_any_transport(self):
         class NoTransportConnection(uc.UEConnection):

@@ -189,6 +189,12 @@ _SECTIONS["timeouts"] = """\
   do not immediately resend it (you would queue it twice). Check
   `connection_status`, give the editor time to finish, then verify the effect
   of the first attempt before retrying.
+- A failed reconnect **right after a timeout** usually means busy, not dead:
+  UE answers discovery on the game thread, so heavy work (compiles, bakes)
+  makes a healthy editor look absent. The error says when the editor process
+  is still alive (`EDITOR_PROCESS_ALIVE_BUT_SILENT` in preflight_discovery) -
+  wait and retry instead of restarting, and size `timeout_seconds` to the
+  operation.
 - Split very large batches into chunks (e.g. 25 assets per call) so each call
   fits comfortably inside the timeout and partial progress is observable.
 - Wrap long loops in `unreal.ScopedSlowTask` for cancellable progress:
