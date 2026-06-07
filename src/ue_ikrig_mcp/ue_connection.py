@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 import time
 import socket
@@ -33,6 +34,7 @@ _PACKAGE_NAME = 'ue-ikrig-mcp'
 
 _WINDOWS_BRIDGE_SCRIPT = r'''
 import json
+import os
 import socket
 import sys
 import time
@@ -44,14 +46,22 @@ PROTOCOL_MAGIC = "ue_py"
 TYPE_PING = "ping"
 TYPE_PONG = "pong"
 TYPE_OPEN_CONNECTION = "open_connection"
+TYPE_CLOSE_CONNECTION = "close_connection"
 TYPE_COMMAND = "command"
 TYPE_COMMAND_RESULT = "command_result"
 BUFFER_SIZE = 8192
 RESULT_PREFIX = "__UE_IKRIG_MCP_BRIDGE_RESULT__"
 
+# Persistent daemon state: one bridge process can keep TCP command channels
+# open to editor nodes across many requests.
+SOURCE_ID = str(uuid.uuid4())
+CHANNELS = {}
+
 
 def emit(payload):
-    print(RESULT_PREFIX + json.dumps(payload, ensure_ascii=False), flush=True)
+    # ensure_ascii=True so the sentinel line survives any pipe codepage
+    # (Windows pipes default to the ANSI codepage, e.g. cp949).
+    print(RESULT_PREFIX + json.dumps(payload, ensure_ascii=True), flush=True)
 
 
 def make_message(type_, source, dest=None, data=None):
@@ -153,10 +163,14 @@ def discover(payload):
     port = int(port)
     ttl = int(payload.get("ttl", 1))
     timeout = max(0.1, float(payload.get("timeout", 2.0)))
+    # Early-exit: once the first pong arrives, wait only a short settle window
+    # for additional editors instead of burning the full timeout.
+    settle = max(0.0, float(payload.get("settle", 0.25)))
     source_id = payload.get("source_id") or str(uuid.uuid4())
     targets = target_candidates(group_host, port, payload.get("targets"))
     nodes = {}
     parse_errors = []
+    first_pong_at = None
     sock = open_udp_socket(group_host, port, ttl, 0.05)
     try:
         deadline = time.time() + timeout
@@ -164,6 +178,8 @@ def discover(payload):
         ping = make_message(TYPE_PING, source_id)
         while time.time() < deadline:
             now = time.time()
+            if first_pong_at is not None and (now - first_pong_at) >= settle:
+                break
             if now >= next_send:
                 for target in targets:
                     try:
@@ -189,6 +205,8 @@ def discover(payload):
             node["node_id"] = node_id
             node["_source_address"] = list(source_address)
             nodes[node_id] = node
+            if first_pong_at is None:
+                first_pong_at = time.time()
     finally:
         sock.close()
     return {
@@ -200,57 +218,87 @@ def discover(payload):
     }
 
 
-def recv_full(conn, timeout):
-    conn.settimeout(timeout)
+class ChannelNotDelivered(OSError):
+    """The command send failed before it could reach Unreal (safe to retry)."""
+
+
+class PeerClosedNoData(OSError):
+    """The channel closed before any response byte arrived (command unseen)."""
+
+
+def recv_json_message(conn, timeout):
+    """Receive one JSON protocol message, framed by parseability.
+
+    The naive `len(part) < BUFFER_SIZE` heuristic truncates fragmented
+    messages and hangs until timeout when a response is an exact multiple
+    of the buffer size. Accumulate and return as soon as the buffer parses.
+    """
+    deadline = time.time() + max(0.1, timeout)
     data = b""
     while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise socket.timeout("timed out waiting for command result")
+        conn.settimeout(remaining)
         part = conn.recv(BUFFER_SIZE)
         if not part:
-            break
+            if data:
+                break
+            raise PeerClosedNoData("connection closed by Unreal Editor")
         data += part
-        if len(part) < BUFFER_SIZE:
-            break
-    return data
+        try:
+            return json.loads(data.decode("utf-8"))
+        except ValueError:
+            continue
+    return json.loads(data.decode("utf-8"))
 
 
-def execute(payload):
+def resolve_node_id(payload):
+    """Return (node_id, error_dict). Discovers the first editor when unset."""
+    node_id = payload.get("node_id")
+    if node_id:
+        return node_id, None
+    timeout = max(0.1, float(payload.get("timeout", 30.0)))
+    discovery = discover({
+        "group": payload.get("group", ["239.0.0.1", 6766]),
+        "ttl": int(payload.get("ttl", 1)),
+        "timeout": min(timeout, 5.0),
+        "settle": payload.get("settle", 0.25),
+        "source_id": payload.get("source_id"),
+        "targets": payload.get("targets"),
+    })
+    if not discovery.get("nodes"):
+        return None, {
+            "ok": False,
+            "error": "No Unreal Editor instances discovered from Windows bridge.",
+            "discovery": discovery,
+        }
+    return discovery["nodes"][0]["node_id"], None
+
+
+def open_command_channel(payload, node_id):
+    """Open a TCP command channel to a node. Returns (socket, error_dict)."""
     group_host, port = payload.get("group", ["239.0.0.1", 6766])
     port = int(port)
     ttl = int(payload.get("ttl", 1))
     timeout = max(0.1, float(payload.get("timeout", 30.0)))
-    source_id = payload.get("source_id") or str(uuid.uuid4())
-    node_id = payload.get("node_id")
+    # The handshake is local-machine UDP + TCP accept; it never legitimately
+    # needs the full command timeout (which may be minutes).
+    handshake_timeout = min(timeout, max(0.5, float(payload.get("handshake_timeout", 10.0))))
     targets = target_candidates(group_host, port, payload.get("targets"))
-    if not node_id:
-        discovery = discover({
-            "group": [group_host, port],
-            "ttl": ttl,
-            "timeout": min(timeout, 5.0),
-            "source_id": source_id,
-            "targets": payload.get("targets"),
-        })
-        if not discovery.get("nodes"):
-            return {
-                "ok": False,
-                "error": "No Unreal Editor instances discovered from Windows bridge.",
-                "discovery": discovery,
-            }
-        node_id = discovery["nodes"][0]["node_id"]
 
     udp = open_udp_socket(group_host, port, ttl, 0.05)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    listener.settimeout(0.25)
-    command_port = listener.getsockname()[1]
-    callback = {
-        "command_ip": "127.0.0.1",
-        "command_port": command_port,
-    }
     try:
-        open_message = make_message(TYPE_OPEN_CONNECTION, source_id, node_id, callback)
-        deadline = time.time() + timeout
-        channel = None
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(0.25)
+        callback = {
+            "command_ip": "127.0.0.1",
+            "command_port": listener.getsockname()[1],
+        }
+        open_message = make_message(TYPE_OPEN_CONNECTION, SOURCE_ID, node_id, callback)
+        deadline = time.time() + handshake_timeout
         while time.time() < deadline:
             for target in targets:
                 try:
@@ -258,47 +306,224 @@ def execute(payload):
                 except OSError:
                     pass
             try:
-                channel, address = listener.accept()
-                break
+                channel, _address = listener.accept()
+                channel.setblocking(True)
+                return channel, None
             except socket.timeout:
                 continue
-        if channel is None:
-            return {
-                "ok": False,
-                "error": "Unreal Editor did not connect back to the Windows bridge.",
-                "callback": callback,
-                "targets": [list(item) for item in targets],
-            }
-        with channel:
-            command = make_message(TYPE_COMMAND, source_id, node_id, {
-                "command": payload.get("code", ""),
-                "unattended": True,
-                "exec_mode": payload.get("mode", "ExecuteFile"),
-            })
-            channel.sendall(command)
-            data = recv_full(channel, timeout)
-        if not data:
-            return {"ok": False, "error": "No command response received from Unreal Editor."}
-        response = parse_message(data)
-        if not passes_receive_filter(response, source_id) or response.get("type") != TYPE_COMMAND_RESULT:
-            return {
-                "ok": False,
-                "error": "Unexpected command response from Unreal Editor.",
-                "response_type": response.get("type"),
-            }
-        return {
-            "ok": True,
-            "node_id": node_id,
+        return None, {
+            "ok": False,
+            "error": "Unreal Editor did not connect back to the Windows bridge.",
             "callback": callback,
             "targets": [list(item) for item in targets],
-            "result": response.get("data") or {},
         }
     finally:
         udp.close()
         listener.close()
 
 
+def run_command(channel, payload, node_id):
+    """Send one command over an open channel and return the bridge result."""
+    timeout = max(0.1, float(payload.get("timeout", 30.0)))
+    command = make_message(TYPE_COMMAND, SOURCE_ID, node_id, {
+        "command": payload.get("code", ""),
+        "unattended": True,
+        "exec_mode": payload.get("mode", "ExecuteFile"),
+    })
+    try:
+        channel.sendall(command)
+    except OSError as exc:
+        # Nothing (complete) reached Unreal; callers may retry safely.
+        raise ChannelNotDelivered("command send failed: %s" % (exc,))
+    response = recv_json_message(channel, timeout)
+    if response.get("version") != PROTOCOL_VERSION or response.get("magic") != PROTOCOL_MAGIC:
+        raise ValueError("Bad protocol header in command response")
+    if not passes_receive_filter(response, SOURCE_ID) or response.get("type") != TYPE_COMMAND_RESULT:
+        # Channel-fatal: an off-type frame means this socket is desynced;
+        # raising makes the caller drop it instead of caching it one
+        # response behind.
+        raise ValueError(
+            "Unexpected command response from Unreal Editor: %r" % (response.get("type"),)
+        )
+    return {
+        "ok": True,
+        "node_id": node_id,
+        "result": response.get("data") or {},
+    }
+
+
+def probe_channel(channel):
+    """Return True when a cached command channel still looks alive."""
+    try:
+        previous = channel.gettimeout()
+    except OSError:
+        return False
+    try:
+        channel.settimeout(0.05)
+        data = channel.recv(1, socket.MSG_PEEK)
+    except socket.timeout:
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            channel.settimeout(previous)
+        except OSError:
+            pass
+    return data != b""
+
+
+def drop_channel(node_id):
+    channel = CHANNELS.pop(node_id, None)
+    if channel is not None:
+        try:
+            channel.close()
+        except OSError:
+            pass
+
+
+def close_all_channels():
+    for node_id in list(CHANNELS):
+        drop_channel(node_id)
+
+
+def execute(payload):
+    """One-shot execute: open a channel, run the command, close the channel."""
+    node_id, error = resolve_node_id(payload)
+    if error is not None:
+        return error
+    channel, error = open_command_channel(payload, node_id)
+    if error is not None:
+        return error
+    try:
+        return run_command(channel, payload, node_id)
+    except socket.timeout as exc:
+        return {"ok": False, "error": "Command timed out: %s" % (exc,)}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    finally:
+        try:
+            channel.close()
+        except OSError:
+            pass
+
+
+def daemon_execute(payload):
+    """Execute over a persistent channel; reopen once if a cached one is stale.
+
+    Retry discipline: a command is re-sent ONLY when the first attempt provably
+    never reached Unreal (send failed, or the peer closed before any response
+    byte). Timeouts and post-send failures never retry — the editor may have
+    executed (or still be executing) the command, and silently re-running
+    non-idempotent code is worse than surfacing the error.
+    """
+    node_id, error = resolve_node_id(payload)
+    if error is not None:
+        return error
+
+    channel = CHANNELS.get(node_id)
+    opened_fresh = channel is None
+    if channel is None:
+        channel, error = open_command_channel(payload, node_id)
+        if error is not None:
+            return error
+        CHANNELS[node_id] = channel
+
+    try:
+        return run_command(channel, payload, node_id)
+    except socket.timeout as exc:
+        # The editor may still be running the command on its game thread;
+        # never re-send it. Drop the channel so the next call starts clean.
+        drop_channel(node_id)
+        return {"ok": False, "error": "Command timed out: %s" % (exc,)}
+    except (ChannelNotDelivered, PeerClosedNoData) as exc:
+        # Provably not executed by Unreal: safe to retry on a fresh channel
+        # when the failure came from a stale cached channel.
+        drop_channel(node_id)
+        if opened_fresh:
+            return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    except (OSError, ValueError) as exc:
+        # Post-send failure: execution state in Unreal is unknown — never
+        # re-send the command.
+        drop_channel(node_id)
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    # Cached channel went stale (editor restarted or closed it) without the
+    # command being seen: reopen once and retry.
+    channel, error = open_command_channel(payload, node_id)
+    if error is not None:
+        return error
+    CHANNELS[node_id] = channel
+    try:
+        return run_command(channel, payload, node_id)
+    except socket.timeout as exc:
+        drop_channel(node_id)
+        return {"ok": False, "error": "Command timed out: %s" % (exc,)}
+    except (OSError, ValueError) as exc:
+        drop_channel(node_id)
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def handle_request(request):
+    op = request.get("op")
+    if op == "ping":
+        # Channel membership alone is not liveness: probe each cached socket
+        # and drop dead ones so a crashed editor never reports as connected.
+        for node_id in list(CHANNELS):
+            if not probe_channel(CHANNELS[node_id]):
+                drop_channel(node_id)
+        return {
+            "ok": True,
+            "op": "ping",
+            "pid": os.getpid(),
+            "channels": sorted(CHANNELS.keys()),
+        }
+    if op == "discover":
+        return discover(request)
+    if op == "execute":
+        return daemon_execute(request)
+    if op == "close":
+        close_all_channels()
+        return {"ok": True, "op": "close"}
+    return {"ok": False, "error": "Unsupported bridge operation: %r" % (op,)}
+
+
+def daemon_loop():
+    """Serve JSON-line requests on stdin until EOF or a shutdown request."""
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            request_id = None
+            try:
+                request = json.loads(line)
+                request_id = request.get("id")
+                if request.get("op") == "shutdown":
+                    emit({"id": request_id, "ok": True, "op": "shutdown"})
+                    break
+                response = handle_request(request)
+            except Exception as exc:
+                response = {
+                    "ok": False,
+                    "error": "%s: %s" % (type(exc).__name__, exc),
+                    "traceback": traceback.format_exc(),
+                }
+            response["id"] = request_id
+            emit(response)
+    finally:
+        close_all_channels()
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+        daemon_loop()
+        return
     with open(sys.argv[1], "r", encoding="utf-8") as f:
         payload = json.load(f)
     try:
@@ -772,6 +997,117 @@ def _ue_output_to_string(value: Any) -> str:
     return str(value)
 
 
+# Common Unreal Python failure signatures mapped to actionable guidance for
+# the MCP driver. First match wins per pattern; at most four hints are emitted.
+_FAILURE_HINT_PATTERNS: list[tuple['re.Pattern[str]', str]] = [
+    (
+        re.compile(r"AttributeError: module 'unreal' has no attribute '(\w+)'"),
+        "unreal.<name> does not exist in this engine version — the API may be renamed, "
+        "deprecated, or hallucinated. Probe first: "
+        "print([n for n in dir(unreal) if 'keyword' in n.lower()]) and check this engine "
+        "version's Python API docs before retrying.",
+    ),
+    (
+        re.compile(r"'NoneType' object has no attribute"),
+        "A lookup returned None (commonly unreal.load_asset with a wrong path) and the "
+        "script used it anyway. Guard every load: a = unreal.load_asset(p); "
+        "if a is None: raise ValueError(p).",
+    ),
+    (
+        re.compile(r"AttributeError: '[^']+' object has no attribute '(\w+)'"),
+        "The object lacks that attribute/method in this engine version. Inspect it first: "
+        "print(type(obj).__name__); print([n for n in dir(obj) if not n.startswith('_')]).",
+    ),
+    (
+        re.compile(r'Failed to load|Failed to find|does not exist|could not be found|not found|is not a valid', re.IGNORECASE),
+        "An asset/path lookup failed. Use object paths like /Game/Folder/Asset "
+        "(no .uasset extension, no Content/ prefix), and list candidates first "
+        "(e.g. list_skeletal_meshes or unreal.AssetRegistryHelpers.get_asset_registry()).",
+    ),
+    (
+        re.compile(r'ModuleNotFoundError|ImportError'),
+        "Module import failed inside Unreal's embedded Python. Only engine/project-bundled "
+        "modules are importable; stdlib modules like json, re, and math are safe.",
+    ),
+    (
+        re.compile(r'is deprecated', re.IGNORECASE),
+        "The script used a deprecated API. Prefer editor subsystems, e.g. "
+        "unreal.get_editor_subsystem(unreal.EditorActorSubsystem / unreal.LevelEditorSubsystem / "
+        "unreal.EditorAssetSubsystem), over EditorLevelLibrary/EditorAssetLibrary.",
+    ),
+    (
+        re.compile(r'SyntaxError'),
+        "Unreal reported a Python syntax error. Check string escaping in generated code "
+        "(quotes, backslashes in paths, f-string braces) and resend.",
+    ),
+]
+
+_TIMEOUT_GUIDANCE = (
+    ' The editor may still be running the script on its game thread. For long operations '
+    'pass a larger timeout_seconds, keep scripts non-interactive (no input()/sleep polling), '
+    'and split very large batches into smaller calls.'
+)
+
+
+def _failure_hints(success: bool, combined: str, parsed: Any) -> list[str]:
+    """Classify common UE Python failures into actionable driver hints."""
+    hints: list[str] = []
+    if not success:
+        for pattern, hint in _FAILURE_HINT_PATTERNS:
+            if pattern.search(combined):
+                hints.append(hint)
+                if len(hints) >= 4:
+                    break
+    elif parsed is None and _MCP_RESULT_SENTINEL not in combined:
+        hints.append(
+            "No __MCP_RESULT__ sentinel was found, so 'parsed' is null. End scripts with "
+            "print('__MCP_RESULT__' + json.dumps(payload)) to return structured data."
+        )
+    return hints
+
+
+def _script_syntax_preflight(code: str, mode: str) -> Optional[dict[str, Any]]:
+    """Reject syntactically invalid scripts locally, before any UE round-trip.
+
+    Returns a normalized failure result dict, or None when the script passes
+    (or preflight is disabled via UE_SCRIPT_PREFLIGHT=0).
+    """
+    if not SCRIPT_PREFLIGHT_ENABLED:
+        return None
+    compile_mode = 'eval' if mode == 'EvaluateStatement' else 'exec'
+    try:
+        compile(code, '<ue_python>', compile_mode)
+    except SyntaxError as e:
+        line_text = (e.text or '').strip()
+        detail = f'SyntaxError: {e.msg} (line {e.lineno}, offset {e.offset})'
+        if line_text:
+            detail += f': {line_text}'
+        if compile_mode == 'eval':
+            extra = (
+                "mode='EvaluateStatement' compiles as a single expression; use "
+                "mode='ExecuteFile' (default) for statements or multi-line scripts."
+            )
+        else:
+            extra = (
+                'Fix the syntax and resend; check escaping of quotes, backslashes in '
+                'asset paths, and f-string braces in generated code.'
+            )
+        return {
+            'success': False,
+            'result': detail,
+            'output': '',
+            'parsed': None,
+            'hints': [
+                'The script was rejected locally before reaching Unreal (no editor round-trip was made).',
+                extra,
+            ],
+        }
+    except ValueError:
+        # Source containing null bytes etc. — let Unreal report it.
+        return None
+    return None
+
+
 def _normalize_command_result(result_data: dict[str, Any]) -> dict[str, Any]:
     success = bool(result_data.get('success', False))
     result_str = _ue_output_to_string(result_data.get('result', ''))
@@ -792,6 +1128,7 @@ def _normalize_command_result(result_data: dict[str, Any]) -> dict[str, Any]:
         'result': result_str,
         'output': output_str,
         'parsed': parsed,
+        'hints': _failure_hints(success, combined, parsed),
     }
 
 
@@ -877,6 +1214,20 @@ WINDOWS_BRIDGE_DISCOVERY_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_DISCOVERY_TIMEOUT
 WINDOWS_BRIDGE_EXEC_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_EXEC_TIMEOUT', 120)
 COMMAND_EXEC_TIMEOUT = max(1, _int_env('UE_COMMAND_EXEC_TIMEOUT', WINDOWS_BRIDGE_EXEC_TIMEOUT))
 CONNECTION_STATUS_TIMEOUT = max(0.01, _float_env('UE_CONNECTION_STATUS_TIMEOUT', 0.25))
+# Persistent Windows bridge daemon (eliminates the per-call process spawn and
+# per-call UDP/TCP handshake). Falls back to one-shot subprocesses when off or
+# when no direct Windows Python launcher can host the daemon.
+WINDOWS_BRIDGE_DAEMON_ENABLED = _bool_env('UE_WINDOWS_BRIDGE_DAEMON', True)
+WINDOWS_BRIDGE_DAEMON_START_TIMEOUT = max(1.0, _float_env('UE_WINDOWS_BRIDGE_DAEMON_START_TIMEOUT', 15.0))
+WINDOWS_BRIDGE_DAEMON_COOLDOWN = max(1.0, _float_env('UE_WINDOWS_BRIDGE_DAEMON_COOLDOWN', 60.0))
+# Bridge discovery results are cached briefly so discover/connect/status calls
+# made back-to-back do not each pay a full discovery round.
+WINDOWS_BRIDGE_NODE_TTL = max(0.0, _float_env('UE_BRIDGE_NODE_CACHE_TTL', 5.0))
+WINDOWS_BRIDGE_EMPTY_NODE_TTL = max(0.0, _float_env('UE_BRIDGE_EMPTY_CACHE_TTL', 2.0))
+# Extra wait after the first discovery pong to catch additional editors.
+DISCOVERY_SETTLE_SECONDS = max(0.0, _float_env('UE_DISCOVERY_SETTLE', 0.25))
+# Local syntax check before shipping scripts to Unreal.
+SCRIPT_PREFLIGHT_ENABLED = _bool_env('UE_SCRIPT_PREFLIGHT', True)
 
 _MCP_RESULT_SENTINEL = '__MCP_RESULT__'
 
@@ -978,6 +1329,196 @@ class _NodeSet:
                     del self._nodes[node_id]
 
 
+class _WindowsBridgeDaemon:
+    """Long-lived Windows-side bridge process speaking JSON lines over stdio.
+
+    One daemon replaces the spawn-per-call subprocess bridge: it keeps the
+    Windows Python interpreter warm and holds persistent TCP command channels
+    to editor nodes, so repeated execute calls skip both the process spawn and
+    the UDP open_connection handshake.
+    """
+
+    def __init__(self, command: list[str], diagnostics: dict[str, Any]):
+        self.command = list(command)
+        self.diagnostics = dict(diagnostics)
+        self._proc: Optional[subprocess.Popen] = None
+        self._script_path: Optional[str] = None
+        self._responses: dict[str, dict[str, Any]] = {}
+        # Only responses for ids in _pending are stored: a late reply to a
+        # request that already timed out is dropped instead of accumulating.
+        self._pending: set[str] = set()
+        self._cond = threading.Condition()
+        self._write_lock = threading.Lock()
+        self._eof = False
+        self._stdout_tail: list[str] = []
+        self._stderr_tail: list[str] = []
+
+    @property
+    def pid(self) -> Optional[int]:
+        return self._proc.pid if self._proc is not None else None
+
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self, ready_timeout: float = WINDOWS_BRIDGE_DAEMON_START_TIMEOUT) -> bool:
+        if self._proc is not None:
+            # One instance hosts one process; callers create a fresh instance
+            # to restart (re-spawning here would orphan the previous child).
+            return self.alive()
+        self._script_path = _write_temp_text(
+            _WINDOWS_BRIDGE_SCRIPT,
+            suffix='.py',
+            prefix='ue_ikrig_mcp_bridge_daemon_',
+        )
+        script_win = _wsl_path_to_windows(self._script_path)
+        try:
+            self._proc = subprocess.Popen(
+                self.command + [script_win, '--daemon'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            self.diagnostics['start_error'] = f'{type(e).__name__}: {e}'
+            self._proc = None
+            self._unlink_script()
+            return False
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+        ready = self.request({'op': 'ping'}, timeout=ready_timeout)
+        if ready is None or not ready.get('ok'):
+            self.diagnostics['start_error'] = (
+                'Bridge daemon did not answer the readiness ping.'
+            )
+            self.stop()
+            return False
+        return True
+
+    def _read_stdout(self) -> None:
+        proc = self._proc
+        try:
+            for line in proc.stdout:
+                line = line.rstrip('\r\n')
+                if line.startswith(_WINDOWS_BRIDGE_RESULT_PREFIX):
+                    try:
+                        payload = json.loads(line[len(_WINDOWS_BRIDGE_RESULT_PREFIX):])
+                    except json.JSONDecodeError:
+                        continue
+                    request_id = payload.get('id')
+                    if request_id:
+                        with self._cond:
+                            if str(request_id) in self._pending:
+                                self._responses[str(request_id)] = payload
+                            self._cond.notify_all()
+                elif line:
+                    self._stdout_tail.append(line)
+                    del self._stdout_tail[:-20]
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self._cond:
+                self._eof = True
+                self._cond.notify_all()
+
+    def _read_stderr(self) -> None:
+        proc = self._proc
+        try:
+            for line in proc.stderr:
+                line = line.rstrip('\r\n')
+                if line:
+                    self._stderr_tail.append(line)
+                    del self._stderr_tail[:-20]
+        except (OSError, ValueError):
+            pass
+
+    def request(self, payload: dict[str, Any], timeout: float) -> Optional[dict[str, Any]]:
+        """Send one request and wait for its response. None on timeout/death."""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return None
+        request_id = str(uuid.uuid4())
+        # ensure_ascii so the request line survives any Windows pipe codepage.
+        line = json.dumps({**payload, 'id': request_id}, ensure_ascii=True)
+        with self._cond:
+            self._pending.add(request_id)
+        # Note: while the daemon is busy with a long command it does not read
+        # stdin, so a concurrent oversized request line can block here until
+        # the daemon loops back — head-of-line waiting, not a deadlock (the
+        # response reader runs on its own thread).
+        with self._write_lock:
+            try:
+                proc.stdin.write(line + '\n')
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                with self._cond:
+                    self._pending.discard(request_id)
+                return None
+        deadline = time.time() + max(0.1, float(timeout))
+        with self._cond:
+            try:
+                while request_id not in self._responses:
+                    if self._eof:
+                        break
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    self._cond.wait(timeout=min(0.25, remaining))
+                return self._responses.pop(request_id, None)
+            finally:
+                self._pending.discard(request_id)
+
+    def stop(self) -> None:
+        proc = self._proc
+        if proc is not None:
+            if proc.poll() is None:
+                with self._write_lock:
+                    try:
+                        proc.stdin.write(
+                            json.dumps({'op': 'shutdown', 'id': str(uuid.uuid4())}) + '\n'
+                        )
+                        proc.stdin.flush()
+                    except (OSError, ValueError):
+                        pass
+                    try:
+                        proc.stdin.close()
+                    except (OSError, ValueError):
+                        pass
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            for stream in (proc.stdout, proc.stderr, proc.stdin):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+            self._proc = None
+        self._unlink_script()
+
+    def _unlink_script(self) -> None:
+        if self._script_path:
+            try:
+                os.unlink(self._script_path)
+            except OSError:
+                pass
+            self._script_path = None
+
+    def tails(self) -> dict[str, Any]:
+        return {
+            'stdout_tail': list(self._stdout_tail),
+            'stderr_tail': list(self._stderr_tail),
+        }
+
+
 class UEConnection:
     """
     Manages discovery and command connection to an Unreal Editor instance
@@ -1035,8 +1576,11 @@ class UEConnection:
         self._last_callback_request: Optional[dict[str, Any]] = None
         self._windows_bridge_node_ids: set[str] = set()
         self._windows_bridge_nodes: list[dict[str, Any]] = []
+        self._windows_bridge_nodes_at: float = 0.0
         self._windows_bridge_connected = False
         self._last_windows_bridge_result: Optional[dict[str, Any]] = None
+        self._bridge_daemon: Optional[_WindowsBridgeDaemon] = None
+        self._bridge_daemon_cooldowns: dict[tuple[str, ...], float] = {}
 
     # ------------------------------------------------------------------
     # Discovery
@@ -1248,6 +1792,73 @@ class UEConnection:
         launcher, _diagnostics = _windows_bridge_launcher()
         return bool(launcher)
 
+    def _ensure_bridge_daemon(
+        self,
+        launchers: list[tuple[list[str], dict[str, Any]]],
+    ) -> Optional[_WindowsBridgeDaemon]:
+        """Return a live bridge daemon, starting one if possible."""
+        daemon = self._bridge_daemon
+        if daemon is not None:
+            if daemon.alive():
+                return daemon
+            daemon.stop()
+            self._bridge_daemon = None
+        now = time.time()
+        for launcher, diagnostics in launchers:
+            if diagnostics.get('type') != 'direct_python':
+                # PowerShell-wrapped launchers stay on the one-shot path.
+                continue
+            key = tuple(launcher)
+            last_failure = self._bridge_daemon_cooldowns.get(key)
+            if last_failure is not None and (now - last_failure) < WINDOWS_BRIDGE_DAEMON_COOLDOWN:
+                continue
+            daemon = _WindowsBridgeDaemon(launcher, diagnostics)
+            if daemon.start():
+                self._bridge_daemon_cooldowns.pop(key, None)
+                self._bridge_daemon = daemon
+                return daemon
+            self._bridge_daemon_cooldowns[key] = now
+            daemon.stop()
+        return None
+
+    def _run_windows_bridge_via_daemon(
+        self,
+        payload: dict[str, Any],
+        timeout: float,
+        launchers: list[tuple[list[str], dict[str, Any]]],
+    ) -> Optional[dict[str, Any]]:
+        """Route a bridge request through the persistent daemon.
+
+        Returns None when no daemon is available (caller falls back to the
+        one-shot subprocess bridge); otherwise a bridge-shaped result dict.
+        """
+        daemon = self._ensure_bridge_daemon(launchers)
+        if daemon is None:
+            return None
+        result = daemon.request(payload, timeout=max(1.0, float(timeout)))
+        diagnostics = {
+            **daemon.diagnostics,
+            'transport': 'persistent_daemon',
+            'pid': daemon.pid,
+        }
+        if result is None:
+            tails = daemon.tails()
+            daemon.stop()
+            self._bridge_daemon = None
+            return _windows_bridge_failure(
+                f'Windows bridge timed out after {timeout} seconds.',
+                _bridge_launcher=diagnostics,
+                _bridge_process={'daemon': True, **tails},
+                _bridge_launcher_failures=[],
+            )
+        result.pop('id', None)
+        result.setdefault('ok', False)
+        result['_bridge_launcher'] = diagnostics
+        result['_bridge_process'] = {'daemon': True, 'pid': daemon.pid}
+        # Shape parity with the one-shot path.
+        result.setdefault('_bridge_launcher_failures', [])
+        return result
+
     def _run_windows_bridge(self, payload: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
         launchers, launcher_diagnostics = _windows_bridge_launcher_candidates()
         if not launchers:
@@ -1256,6 +1867,12 @@ class UEConnection:
                 'error': 'Windows bridge launcher was not found.',
                 '_bridge_launcher': launcher_diagnostics,
             }
+
+        if WINDOWS_BRIDGE_DAEMON_ENABLED:
+            daemon_result = self._run_windows_bridge_via_daemon(payload, timeout, launchers)
+            if daemon_result is not None:
+                self._last_windows_bridge_result = daemon_result
+                return daemon_result
 
         script_path = ''
         payload_path = ''
@@ -1385,13 +2002,29 @@ class UEConnection:
                     except OSError:
                         pass
 
-    def _discover_windows_bridge_nodes(self, timeout: float = 2.0) -> list[dict[str, Any]]:
+    def _discover_windows_bridge_nodes(
+        self,
+        timeout: float = 2.0,
+        max_age: Optional[float] = None,
+    ) -> list[dict[str, Any]]:
+        # Serve recent discovery results from cache so back-to-back
+        # discover/connect/status calls do not each pay a discovery round.
+        if max_age is None:
+            max_age = WINDOWS_BRIDGE_NODE_TTL if self._windows_bridge_nodes else WINDOWS_BRIDGE_EMPTY_NODE_TTL
+        if (
+            max_age > 0
+            and self._windows_bridge_nodes_at > 0
+            and (time.time() - self._windows_bridge_nodes_at) < max_age
+        ):
+            return list(self._windows_bridge_nodes)
+
         result = self._run_windows_bridge(
             {
                 'op': 'discover',
                 'group': list(self._multicast_group),
                 'ttl': max(1, int(self._multicast_ttl)),
                 'timeout': timeout,
+                'settle': DISCOVERY_SETTLE_SECONDS,
             },
             timeout=max(5.0, timeout + 3.0),
         )
@@ -1399,6 +2032,7 @@ class UEConnection:
         self._windows_bridge_node_ids = set()
         if not result.get('ok'):
             self._windows_bridge_nodes = []
+            self._windows_bridge_nodes_at = time.time()
             return nodes
         for node in result.get('nodes') or []:
             if not isinstance(node, dict):
@@ -1411,6 +2045,7 @@ class UEConnection:
             nodes.append(entry)
             self._windows_bridge_node_ids.add(str(node_id))
         self._windows_bridge_nodes = nodes
+        self._windows_bridge_nodes_at = time.time()
         return nodes
 
     def _activate_windows_bridge_node(self, node_id: Optional[str]) -> bool:
@@ -1549,8 +2184,10 @@ class UEConnection:
                 bridge_nodes: list[dict[str, Any]] = []
                 bridge_result: Optional[dict[str, Any]] = None
                 if self._windows_bridge_supported():
+                    # Preflight is a doctor: always probe live, never serve cache.
                     bridge_nodes = self._discover_windows_bridge_nodes(
                         timeout=float(WINDOWS_BRIDGE_DISCOVERY_TIMEOUT),
+                        max_age=0.0,
                     )
                     bridge_result = self._last_windows_bridge_result
                 if bridge_result is not None:
@@ -1827,10 +2464,19 @@ class UEConnection:
         Raises:
             UEConnectionError: Not connected.
         """
+        # Local syntax preflight: reject malformed scripts in microseconds
+        # instead of paying a full editor round-trip to learn the same thing.
+        preflight_failure = _script_syntax_preflight(code, mode)
+        if preflight_failure is not None:
+            return preflight_failure
+
         if self._command_channel_socket is not None and not self._windows_bridge_connected:
             self._probe_direct_command_socket_liveness()
         if not self.is_connected():
-            raise UEConnectionError('Not connected to Unreal Editor. Call connect() first.')
+            raise UEConnectionError(
+                'Not connected to Unreal Editor. Call connect_to_editor first '
+                '(or connect() when driving UEConnection directly).'
+            )
 
         if self._windows_bridge_connected:
             command_timeout = max(
@@ -1852,8 +2498,10 @@ class UEConnection:
             if not result.get('ok'):
                 self._windows_bridge_connected = False
                 self._mark_transport_disconnected()
+                error_text = str(result.get('error', 'unknown error'))
+                guidance = _TIMEOUT_GUIDANCE if 'timed out' in error_text.lower() else ''
                 raise UEConnectionError(
-                    f'Windows bridge command execution failed: {result.get("error", "unknown error")}'
+                    f'Windows bridge command execution failed: {error_text}{guidance}'
             )
             return _normalize_command_result(result.get('result') or {})
 
@@ -1872,18 +2520,26 @@ class UEConnection:
             command_socket.settimeout(command_timeout)
             command_socket.sendall(msg.to_json_bytes())
 
-            # Receive full response
+            # Receive the full response, framed by JSON parseability: the old
+            # `len(part) < buffer` heuristic truncated fragmented messages and
+            # hung until timeout on responses sized at exact buffer multiples.
             data = b''
             while True:
                 part = command_socket.recv(_DEFAULT_RECEIVE_BUFFER_SIZE)
-                data += part
-                if len(part) < _DEFAULT_RECEIVE_BUFFER_SIZE:
+                if not part:
                     break
+                data += part
+                try:
+                    json.loads(data.decode('utf-8'))
+                    break
+                except ValueError:
+                    continue
         except socket.timeout as e:
             self._cleanup_command_sockets()
             self._mark_transport_disconnected()
             raise UEConnectionError(
                 f'Command channel timed out after {command_timeout:g} seconds waiting for Unreal Editor response.'
+                + _TIMEOUT_GUIDANCE
             ) from e
         except OSError as e:
             self._cleanup_command_sockets()
@@ -1931,6 +2587,13 @@ class UEConnection:
             except Exception:
                 pass
         self._cleanup_command_sockets()
+        if self._bridge_daemon is not None:
+            try:
+                self._bridge_daemon.request({'op': 'close'}, timeout=2.0)
+            except Exception:
+                pass
+            self._bridge_daemon.stop()
+            self._bridge_daemon = None
         self._running = False
         if self._listen_thread:
             self._listen_thread.join(timeout=2.0)
@@ -1949,6 +2612,7 @@ class UEConnection:
         self._windows_bridge_connected = False
         self._windows_bridge_node_ids = set()
         self._windows_bridge_nodes = []
+        self._windows_bridge_nodes_at = 0.0
 
     def _cleanup_command_sockets(self) -> None:
         if self._command_channel_socket:
@@ -2075,6 +2739,32 @@ class UEConnection:
                 'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
             }
 
+        # Fast path: ask the persistent daemon. An open command channel to the
+        # node is direct proof of liveness with no discovery round at all.
+        daemon = self._bridge_daemon
+        if WINDOWS_BRIDGE_DAEMON_ENABLED and daemon is not None and daemon.alive():
+            ping = daemon.request({'op': 'ping'}, timeout=max(1.0, CONNECTION_STATUS_TIMEOUT * 4))
+            if ping is not None and ping.get('ok'):
+                channels = ping.get('channels') or []
+                if node_id in channels:
+                    return {
+                        'transport': 'windows_subprocess',
+                        'ok': True,
+                        'state': 'daemon_channel_open',
+                        'node_id': node_id,
+                        'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+                    }
+            else:
+                # Wedged daemon: clear it so the next call restarts cleanly.
+                daemon.stop()
+                self._bridge_daemon = None
+
+        # Liveness must be proven fresh: invalidate the node cache so the
+        # fallback discovery below cannot serve a stale (up to TTL-old) hit
+        # for an editor that just died. The cache timestamp is reset rather
+        # than passing max_age so subclass overrides of
+        # _discover_windows_bridge_nodes keep their (timeout) signature.
+        self._windows_bridge_nodes_at = 0.0
         try:
             nodes = self._discover_windows_bridge_nodes(timeout=CONNECTION_STATUS_TIMEOUT)
         except Exception as e:
@@ -2190,6 +2880,11 @@ class UEConnection:
             'node_ids': sorted(self._windows_bridge_node_ids),
             'nodes': list(self._windows_bridge_nodes),
             'last_result': last_bridge_result,
+            'daemon': {
+                'enabled': WINDOWS_BRIDGE_DAEMON_ENABLED,
+                'running': bool(self._bridge_daemon is not None and self._bridge_daemon.alive()),
+                'pid': self._bridge_daemon.pid if self._bridge_daemon is not None else None,
+            },
         }
         status['network'] = _network_diagnostics(self._multicast_group[0])
         return status

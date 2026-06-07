@@ -104,10 +104,11 @@ ue-ikrig-mcp
 - `get_global_settings` / `set_global_settings` - Global retarget settings
 - `create_retarget_pose` / `set_current_pose` - Pose management
 
-### Batch & Utility (3)
+### Batch & Utility (4)
 - `batch_retarget` - Bulk retarget animations
-- `execute_python` - Raw Python escape hatch (`mode` and optional `timeout_seconds`)
+- `execute_python` - Raw Python escape hatch (`mode` and optional `timeout_seconds`); auto-connects, validates syntax locally, returns failure `hints`
 - `list_skeletal_meshes` - Find skeletal meshes
+- `ue_python_guide` - Unreal Python scripting guide for MCP drivers (result protocol, asset paths, API pitfalls, timeouts)
 
 ### Capture (3)
 - `capture_viewport` - Level editor viewport screenshot via UE AutomationLibrary (hardened with realtime/repaint forcing)
@@ -163,7 +164,38 @@ UE_WINDOWS_BRIDGE=true                 # WSL default; set false to disable
 UE_WINDOWS_PYTHON=/mnt/c/.../python.exe # explicit Windows Python for bridge
 UE_WINDOWS_BRIDGE_DISCOVERY_TIMEOUT=5  # seconds for Windows-side discovery
 UE_WINDOWS_BRIDGE_EXEC_TIMEOUT=120     # seconds for bridge command execution
+UE_WINDOWS_BRIDGE_DAEMON=true          # persistent Windows bridge daemon; false = one-shot per call
+UE_WINDOWS_BRIDGE_DAEMON_START_TIMEOUT=15  # seconds to wait for daemon readiness ping
+UE_WINDOWS_BRIDGE_DAEMON_COOLDOWN=60   # seconds before retrying a launcher whose daemon failed
+UE_BRIDGE_NODE_CACHE_TTL=5             # seconds to cache bridge discovery results
+UE_BRIDGE_EMPTY_CACHE_TTL=2            # seconds to cache an empty discovery result
+UE_DISCOVERY_SETTLE=0.25               # extra wait after first pong for more editors
+UE_SCRIPT_PREFLIGHT=true               # local syntax check before sending scripts to UE
 ```
+
+### Windows bridge daemon (performance)
+
+On WSL the bridge keeps one persistent Windows Python process alive
+(`UE_WINDOWS_BRIDGE_DAEMON=true`, the default) instead of spawning a process
+per call. The daemon also holds the TCP command channel to the editor open
+across `execute_python` calls, discovery early-exits on the first pong, and
+discovery results are cached for `UE_BRIDGE_NODE_CACHE_TTL` seconds. Measured
+against a live editor this takes repeat discovery from ~4.7s to ~0.05s,
+`connect_to_editor` from ~4.8s to ~0.05s, and repeat `execute_python` from
+~0.6s to ~0.3s. Set `UE_WINDOWS_BRIDGE_DAEMON=false` to restore the previous
+one-shot behavior.
+
+### Script guidance for MCP drivers
+
+- `ue_python_guide` returns the scripting guide (result protocol, asset-path
+  rules, modern vs deprecated APIs, timeout discipline, failure triage); read
+  it once per session before generating non-trivial scripts.
+- `execute_python` auto-connects when no editor connection exists, validates
+  script syntax locally before any editor round-trip
+  (`UE_SCRIPT_PREFLIGHT=false` to disable), and failed results include a
+  `hints` list that classifies common Unreal Python failures (hallucinated or
+  deprecated APIs, bad asset paths, missing `__MCP_RESULT__` sentinel,
+  timeouts) into actionable fixes.
 
 Failed preflight output includes OS/WSL detection, local IPv4 candidates, the
 route-selected local address for the multicast group, bind/interface/membership

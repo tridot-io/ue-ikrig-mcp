@@ -88,7 +88,19 @@ def register(server):
         description=(
             "Execute arbitrary Python code in Unreal Engine. "
             "Raw escape hatch for advanced operations not covered by other tools. "
-            "The code string is sent directly to UE's Python interpreter."
+            "The code string is sent directly to UE's Python interpreter. "
+            "Auto-connects to the first discovered editor when not yet connected. "
+            "Rules for reliable scripts: "
+            "(1) to return structured data, end the script with "
+            "print('__MCP_RESULT__' + json.dumps(payload)) — it comes back in 'parsed'; "
+            "(2) asset paths are object paths like /Game/Folder/Asset (no .uasset extension, "
+            "no Content/ prefix); always guard unreal.load_asset() results against None; "
+            "(3) prefer editor subsystems (unreal.get_editor_subsystem(...)) over deprecated "
+            "EditorLevelLibrary/EditorAssetLibrary calls; "
+            "(4) scripts run synchronously on the editor game thread — never call input() or "
+            "poll with sleep loops, and pass timeout_seconds for long batch operations; "
+            "(5) syntax is checked locally before sending, and failures include actionable "
+            "'hints'. Call ue_python_guide for the full scripting guide."
         ),
     )
     async def execute_python(
@@ -100,6 +112,21 @@ def register(server):
             conn = get_connection()
         except UENotRunningError as e:
             return _err(str(e))
+
+        # Auto-connect so a fresh session's first execute_python call works
+        # without an explicit connect_to_editor round-trip.
+        if (
+            hasattr(conn, "is_connected")
+            and hasattr(conn, "connect")
+            and not conn.is_connected()
+        ):
+            try:
+                conn.connect()
+            except (UENotRunningError, UEConnectionError) as e:
+                return _err(
+                    f"Auto-connect to Unreal Editor failed: {e} "
+                    "Run preflight_discovery to diagnose the transport."
+                )
 
         try:
             result = conn.execute(code, mode=mode, timeout=timeout_seconds)

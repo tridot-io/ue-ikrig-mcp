@@ -13,7 +13,7 @@ from .tools import (
     fbik_tuning, phat_diagnostics, bone_diagnostics,
     offset_persistence, retarget_helpers, tapython_bridge,
     fbx_batch, sequencer_export, root_motion_ops, anim_notifies,
-    cr_author, batch_ops,
+    cr_author, batch_ops, guide,
 )
 
 
@@ -47,6 +47,7 @@ def register_all_tools():
     anim_notifies.register(server)
     cr_author.register(server)
     batch_ops.register(server)
+    guide.register(server)
 
 
 def main():
