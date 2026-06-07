@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ue-ikrig-mcp"
-version = "0.13.3"
+version = "0.13.4"
 description = "MCP server for creating and fine-tuning IK Rigs, IK Retargeters, and Control Rig graphs in Unreal Engine 5"
 requires-python = ">=3.10"
 dependencies = ["mcp>=1.0.0", "mss>=9.0"]
@@ -17,10 +17,9 @@ Repository = "https://github.com/tridot-io/ue-ikrig-mcp"
 [project.scripts]
 ue-ikrig-mcp = "ue_ikrig_mcp.server:main"
 
-# Make sure shipped JSON data files (skeleton fingerprints, presets, schema)
-# and the preset README land in the wheel alongside the Python sources.
+# The package glob ships everything under src/ue_ikrig_mcp, including the
+# JSON data files (skeleton fingerprints, presets, schema). Do NOT also
+# force-include data/: hatchling >= 1.27 rejects duplicate archive paths,
+# which breaks every `uvx --from git+...` install with a -32000 MCP error.
 [tool.hatch.build.targets.wheel]
 packages = ["src/ue_ikrig_mcp"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/ue_ikrig_mcp/data" = "ue_ikrig_mcp/data"
