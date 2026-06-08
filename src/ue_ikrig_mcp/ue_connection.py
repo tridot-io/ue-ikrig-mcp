@@ -273,6 +273,7 @@ def resolve_node_id(payload):
             "ok": False,
             "error": "No Unreal Editor instances discovered from Windows bridge.",
             "discovery": discovery,
+            "delivered": False,
         }
     return discovery["nodes"][0]["node_id"], None
 
@@ -317,6 +318,9 @@ def open_command_channel(payload, node_id):
             "error": "Unreal Editor did not connect back to the Windows bridge.",
             "callback": callback,
             "targets": [list(item) for item in targets],
+            # The command channel never opened, so nothing was executed: the
+            # caller may safely rediscover the current editor and retry.
+            "delivered": False,
         }
     finally:
         udp.close()
@@ -400,7 +404,17 @@ def execute(payload):
         return run_command(channel, payload, node_id)
     except socket.timeout as exc:
         return {"ok": False, "error": "Command timed out: %s" % (exc,)}
+    except ChannelNotDelivered as exc:
+        # The send failed: nothing (complete) reached Unreal, so the caller may
+        # rediscover the current editor and retry safely.
+        return {
+            "ok": False,
+            "error": "%s: %s" % (type(exc).__name__, exc),
+            "delivered": False,
+        }
     except (OSError, ValueError) as exc:
+        # PeerClosedNoData (an OSError) and post-send errors land here: the
+        # frame may have executed before the failure, so no delivered flag.
         return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
     finally:
         try:
@@ -437,12 +451,23 @@ def daemon_execute(payload):
         # never re-send it. Drop the channel so the next call starts clean.
         drop_channel(node_id)
         return {"ok": False, "error": "Command timed out: %s" % (exc,)}
-    except (ChannelNotDelivered, PeerClosedNoData) as exc:
-        # Provably not executed by Unreal: safe to retry on a fresh channel
-        # when the failure came from a stale cached channel.
+    except ChannelNotDelivered as exc:
+        # The send itself failed, so nothing (complete) reached Unreal: safe to
+        # retry. On a fresh channel, tell the client it may rediscover+retry;
+        # on a cached channel, reopen and retry below.
         drop_channel(node_id)
         if opened_fresh:
-            return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+            return {
+                "ok": False,
+                "error": "%s: %s" % (type(exc).__name__, exc),
+                "delivered": False,
+            }
+    except PeerClosedNoData as exc:
+        # The frame WAS sent and the peer then closed before responding. Unreal
+        # may have executed it (side effects) before dying, so its state is
+        # unknown - never auto-retry (double-execution guard). No delivered flag.
+        drop_channel(node_id)
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
     except (OSError, ValueError) as exc:
         # Post-send failure: execution state in Unreal is unknown — never
         # re-send the command.
@@ -2515,6 +2540,40 @@ class UEConnection:
     # Command execution
     # ------------------------------------------------------------------
 
+    def _bridge_execute_payload(self, code: str, mode: str, command_timeout: float) -> dict[str, Any]:
+        # node_id is read live so a reconnect to a new editor retargets here.
+        return {
+            'op': 'execute',
+            'group': list(self._multicast_group),
+            'ttl': max(1, int(self._multicast_ttl)),
+            'node_id': self._remote_node_id,
+            'code': code,
+            'mode': mode,
+            'timeout': command_timeout,
+        }
+
+    def _reconnect_after_restart(self) -> bool:
+        """Drop a stale pinned editor node and reconnect to the current one.
+
+        Called only when the last command provably never ran, so re-running it
+        on the new editor is safe. Forces a fresh discovery (bypasses the node
+        TTL cache, which may still list the dead editor). Returns True when the
+        Windows bridge is connected again."""
+        self._windows_bridge_connected = False
+        self._remote_node_id = None
+        self._mark_transport_disconnected()
+        self._windows_bridge_nodes_at = 0.0
+        self._windows_bridge_node_ids = set()
+        self._windows_bridge_nodes = []
+        # Also drop the direct-UDP registry so a stale node there cannot be
+        # re-pinned by connect() on non-bridge transports.
+        self._nodes = _NodeSet()
+        try:
+            self.connect()
+        except (UENotRunningError, UEConnectionError):
+            return False
+        return self._windows_bridge_connected
+
     def execute(self, code: str, mode: str = 'ExecuteFile', timeout: Optional[float] = None) -> dict:
         """
         Execute Python code in the connected Unreal Editor.
@@ -2550,17 +2609,23 @@ class UEConnection:
                 float(WINDOWS_BRIDGE_EXEC_TIMEOUT if timeout is None else timeout),
             )
             result = self._run_windows_bridge(
-                {
-                    'op': 'execute',
-                    'group': list(self._multicast_group),
-                    'ttl': max(1, int(self._multicast_ttl)),
-                    'node_id': self._remote_node_id,
-                    'code': code,
-                    'mode': mode,
-                    'timeout': command_timeout,
-                },
+                self._bridge_execute_payload(code, mode, command_timeout),
                 timeout=command_timeout + 5.0,
             )
+            # First call after an editor restart hits a pinned node that no
+            # longer exists: the channel handshake never completes, so the
+            # command provably never ran (delivered is False). Rediscover the
+            # current editor and retry once instead of surfacing a spurious
+            # failure that only clears on the *next* call.
+            if (
+                not result.get('ok')
+                and result.get('delivered') is False
+                and self._reconnect_after_restart()
+            ):
+                result = self._run_windows_bridge(
+                    self._bridge_execute_payload(code, mode, command_timeout),
+                    timeout=command_timeout + 5.0,
+                )
             if not result.get('ok'):
                 self._windows_bridge_connected = False
                 self._mark_transport_disconnected()

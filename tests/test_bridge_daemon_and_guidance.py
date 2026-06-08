@@ -260,6 +260,73 @@ class EditorBusyClassificationTests(unittest.TestCase):
         self.assertIn("busy", result["next_action"])
 
 
+class EditorRestartRecoveryTests(unittest.TestCase):
+    """First execute after an editor restart must transparently recover."""
+
+    def _make_connection(self, first_execute_result):
+        class RestartConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self.execute_targets = []
+                self.discovers = 0
+
+            def _windows_bridge_supported(self):
+                return True
+
+            def _run_windows_bridge(self, payload, timeout=10.0):
+                op = payload["op"]
+                if op == "discover":
+                    self.discovers += 1
+                    return {"ok": True, "nodes": [{"node_id": "B", "project_name": "P"}]}
+                if op == "execute":
+                    self.execute_targets.append(payload["node_id"])
+                    if payload["node_id"] == "A":
+                        return first_execute_result
+                    return {  # the restarted editor (node B) answers
+                        "ok": True,
+                        "result": {"success": True, "result": "",
+                                   "output": '__MCP_RESULT__{"ran": true}'},
+                    }
+                raise AssertionError(payload)
+
+        conn = RestartConnection()
+        conn._running = True
+        conn._windows_bridge_connected = True
+        conn._remote_node_id = "A"  # pinned to the editor that just restarted
+        return conn
+
+    def test_first_execute_after_restart_recovers_on_retry(self):
+        conn = self._make_connection({
+            "ok": False,
+            "error": "Unreal Editor did not connect back to the Windows bridge.",
+            "delivered": False,
+        })
+
+        result = conn.execute("print('hi')")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["parsed"], {"ran": True})
+        # Tried the dead node, rediscovered, retried against the new node.
+        self.assertEqual(conn.execute_targets, ["A", "B"])
+        self.assertEqual(conn.discovers, 1)
+        self.assertEqual(conn._remote_node_id, "B")
+
+    def test_timeout_failure_never_retries(self):
+        # A timeout means the command may still be running on the game thread;
+        # re-running it (double execution) is the cardinal sin. No delivered
+        # flag -> no reconnect, no retry.
+        conn = self._make_connection({
+            "ok": False,
+            "error": "Command timed out: timed out",
+        })
+
+        with self.assertRaises(uc.UEConnectionError):
+            conn.execute("destroy_everything()")
+
+        self.assertEqual(conn.execute_targets, ["A"])  # exactly one attempt
+        self.assertEqual(conn.discovers, 0)
+
+
 class ScriptGuidanceTests(unittest.TestCase):
     def test_syntax_preflight_blocks_before_any_transport(self):
         class NoTransportConnection(uc.UEConnection):
@@ -501,6 +568,61 @@ class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(channel.sendall_count, 1)
         self.assertNotIn("node-1", ns["CHANNELS"])
+
+    def test_peer_closed_after_send_never_retries(self):
+        # sendall succeeds, then the peer closes before any response byte:
+        # Unreal may have executed before dying, so this must NOT auto-retry
+        # and must NOT be tagged delivered (would license a client retry).
+        ns = _exec_bridge_script()
+
+        class ClosedAfterSend:
+            def __init__(self):
+                self.sendall_count = 0
+
+            def gettimeout(self):
+                return None
+
+            def settimeout(self, value):
+                pass
+
+            def sendall(self, data):
+                self.sendall_count += 1
+
+            def recv(self, size, flags=0):
+                return b""  # peer closed, no data -> PeerClosedNoData
+
+            def close(self):
+                pass
+
+        channel = ClosedAfterSend()
+        ns["CHANNELS"]["node-1"] = channel
+        ns["open_command_channel"] = lambda payload, node_id: (_ for _ in ()).throw(
+            AssertionError("must not reopen/retry after peer-closed-post-send")
+        )
+
+        result = ns["daemon_execute"]({"node_id": "node-1", "code": "x", "timeout": 1.0})
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("delivered", result)  # no retry license for the client
+        self.assertEqual(channel.sendall_count, 1)
+
+    def test_one_shot_execute_tags_send_failure_delivered_false(self):
+        ns = _exec_bridge_script()
+
+        class DeadChannel:
+            def sendall(self, data):
+                raise OSError("broken pipe")
+
+            def close(self):
+                pass
+
+        ns["resolve_node_id"] = lambda payload: ("node-1", None)
+        ns["open_command_channel"] = lambda payload, node_id: (DeadChannel(), None)
+
+        result = ns["execute"]({"node_id": "node-1", "code": "x", "timeout": 1.0})
+
+        self.assertFalse(result["ok"])
+        self.assertIs(result["delivered"], False)
 
     def test_pre_send_failure_on_cached_channel_retries_once(self):
         ns = _exec_bridge_script()
