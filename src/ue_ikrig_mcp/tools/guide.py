@@ -53,8 +53,10 @@ mcp_result({"materials": [str(m.material_slot_name) for m in mesh.materials]})
   rather than letting an exception discard partial results.
 - When `parsed` is present the raw output echo is omitted from the response
   (compact mode); pass `compact=False` if you genuinely need stdout text.
-- `mode`: keep the default `ExecuteFile`; `EvaluateStatement` is for a single
-  expression only (helpers are not injected in statement/expression modes).
+- `mode`: keep the default `ExecuteFile`; aliases like `execute`/`exec` are
+  normalized to `ExecuteFile` before Unreal sees them. `EvaluateStatement` is
+  for a single expression only (helpers are not injected in statement/expression
+  modes).
 - Helpers can be disabled with `inject_helpers=False` (e.g. for scripts using
   `from __future__` imports, which must be the first statement).
 """

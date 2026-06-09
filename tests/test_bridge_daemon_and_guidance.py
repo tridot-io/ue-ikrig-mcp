@@ -353,6 +353,16 @@ class ScriptGuidanceTests(unittest.TestCase):
         self.assertIsNone(uc._script_syntax_preflight("1 + 1", "EvaluateStatement"))
         self.assertIsNone(uc._script_syntax_preflight("x = 1", "ExecuteFile"))
 
+    def test_execution_mode_aliases_are_normalized_before_unreal(self):
+        self.assertEqual(uc.normalize_execution_mode("execute"), "ExecuteFile")
+        self.assertEqual(uc.normalize_execution_mode("eval"), "EvaluateStatement")
+        self.assertIsNone(uc._script_syntax_preflight("x = 1", "execute"))
+
+        result = uc._script_syntax_preflight("x = 1", "definitely-not-a-mode")
+        self.assertIsNotNone(result)
+        self.assertFalse(result["success"])
+        self.assertIn("Invalid Unreal Python execution mode", result["result"])
+
     def test_failure_hints_classify_unreal_attribute_error(self):
         result = uc._normalize_command_result({
             "success": False,
@@ -847,6 +857,15 @@ class PreludeInjectionTests(unittest.TestCase):
         self.assertIn("def load(path):", sent_code)
         self.assertIn("def mcp_result(payload):", sent_code)
         self.assertTrue(sent_code.endswith("mcp_result({'x': 1})"))
+        self.assertEqual(conn.execute_calls[0][1], "ExecuteFile")
+
+    def test_execute_alias_gets_prelude_and_normalized_mode(self):
+        conn = _CapturingConnection()
+        self._run_execute_python(conn, "mcp_result({'x': 1})", mode="execute")
+
+        sent_code, sent_mode, _ = conn.execute_calls[0]
+        self.assertIn("def mcp_result(payload):", sent_code)
+        self.assertEqual(sent_mode, "ExecuteFile")
 
     def test_statement_mode_and_opt_out_skip_prelude(self):
         conn = _CapturingConnection()

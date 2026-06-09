@@ -1107,6 +1107,59 @@ EDITOR_BUSY_MESSAGE = (
     'the editor or resend the last script.'
 )
 
+_EXECUTION_MODE_ALIASES = {
+    'executefile': 'ExecuteFile',
+    'execute': 'ExecuteFile',
+    'exec': 'ExecuteFile',
+    'file': 'ExecuteFile',
+    'script': 'ExecuteFile',
+    'run': 'ExecuteFile',
+    'statement': 'ExecuteStatement',
+    'executestatement': 'ExecuteStatement',
+    'execstatement': 'ExecuteStatement',
+    'eval': 'EvaluateStatement',
+    'evaluate': 'EvaluateStatement',
+    'expression': 'EvaluateStatement',
+    'evaluatestatement': 'EvaluateStatement',
+}
+
+
+def _execution_mode_key(mode: Any) -> str:
+    return re.sub(r'[^a-z]', '', str(mode).strip().lower())
+
+
+def normalize_execution_mode(mode: Any) -> str:
+    """Return the Unreal Remote Execution mode name accepted by the editor.
+
+    Unreal's Python remote execution protocol expects enum-style mode names
+    such as ``ExecuteFile``. Drivers often send human/tool-style aliases like
+    ``execute``; normalize those locally so the editor never receives an
+    unparsable ``exec_mode`` value.
+    """
+    if mode is None or str(mode).strip() == '':
+        return 'ExecuteFile'
+    key = _execution_mode_key(mode)
+    if key in _EXECUTION_MODE_ALIASES:
+        return _EXECUTION_MODE_ALIASES[key]
+    raise ValueError(
+        f"Invalid Unreal Python execution mode {mode!r}. Use one of: "
+        "ExecuteFile, ExecuteStatement, EvaluateStatement."
+    )
+
+
+def _invalid_execution_mode_result(mode: Any, error: Exception) -> dict[str, Any]:
+    return {
+        'success': False,
+        'result': str(error),
+        'output': '',
+        'parsed': None,
+        'hints': [
+            "The command was rejected locally before reaching Unreal (no editor round-trip was made).",
+            "Use mode='ExecuteFile' for normal scripts. Aliases like 'execute' are normalized to ExecuteFile.",
+            "Use mode='EvaluateStatement' only for a single expression; use 'ExecuteStatement' only for a single statement.",
+        ],
+    }
+
 
 def _failure_hints(success: bool, combined: str, parsed: Any) -> list[str]:
     """Classify common UE Python failures into actionable driver hints."""
@@ -1133,7 +1186,11 @@ def _script_syntax_preflight(code: str, mode: str) -> Optional[dict[str, Any]]:
     """
     if not SCRIPT_PREFLIGHT_ENABLED:
         return None
-    compile_mode = 'eval' if mode == 'EvaluateStatement' else 'exec'
+    try:
+        normalized_mode = normalize_execution_mode(mode)
+    except ValueError as e:
+        return _invalid_execution_mode_result(mode, e)
+    compile_mode = 'eval' if normalized_mode == 'EvaluateStatement' else 'exec'
     try:
         compile(code, '<ue_python>', compile_mode)
     except SyntaxError as e:
@@ -2589,6 +2646,11 @@ class UEConnection:
         Raises:
             UEConnectionError: Not connected.
         """
+        try:
+            mode = normalize_execution_mode(mode)
+        except ValueError as e:
+            return _invalid_execution_mode_result(mode, e)
+
         # Local syntax preflight: reject malformed scripts in microseconds
         # instead of paying a full editor round-trip to learn the same thing.
         preflight_failure = _script_syntax_preflight(code, mode)

@@ -7,7 +7,7 @@ output echoed back into the driver's context.
 
 from typing import Any, Optional
 
-from .ue_connection import UENotRunningError, UEConnectionError
+from .ue_connection import UENotRunningError, UEConnectionError, normalize_execution_mode
 
 # Prepended to every ExecuteFile-mode driver script (execute_python and
 # run_script) unless inject_helpers=False. Keep it small and side-effect free:
@@ -59,7 +59,7 @@ def prepare_user_code(code: str, mode: str, inject_helpers: bool) -> str:
     Only ExecuteFile mode gets the prelude: the statement/expression modes
     compile a single unit where prepended definitions are invalid.
     """
-    if not inject_helpers or mode != "ExecuteFile":
+    if not inject_helpers or normalize_execution_mode(mode) != "ExecuteFile":
         return code
     return EXECUTE_PYTHON_PRELUDE + "\n" + code
 

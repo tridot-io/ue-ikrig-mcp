@@ -7,6 +7,8 @@ from ..ue_connection import (
     get_connection,
     UENotRunningError,
     UEConnectionError,
+    normalize_execution_mode,
+    _invalid_execution_mode_result,
     _script_syntax_preflight,
 )
 from ..ue_scripts import wrap_script, escape_string, build_asset_registry_query
@@ -126,6 +128,10 @@ def register(server):
             conn = get_connection()
         except UENotRunningError as e:
             return _err(str(e))
+        try:
+            mode = normalize_execution_mode(mode)
+        except ValueError as e:
+            return _ok(_invalid_execution_mode_result(mode, e))
 
         # Preflight the user code alone so SyntaxError line numbers are not
         # shifted by the injected prelude.
