@@ -133,6 +133,14 @@ Claude Code  <--stdio-->  MCP Server (Python)  <--UDP/TCP-->  UE Editor
 
 The server communicates with UE Editor via the built-in Python Remote Execution protocol (UDP multicast discovery + TCP commands). If the configured command port is still held by another local MCP process, `connect_to_editor` automatically falls back to a free local port unless `UE_COMMAND_PORT_STRICT=true` is set.
 
+Multiple independent MCP server processes may connect to the same Unreal Editor.
+That concurrency boundary is **per MCP process**: each process keeps its own
+discovery state, local command listener, and optional Windows bridge daemon. It
+does **not** mean one MCP process can hold multiple active editor connections at
+once. When a second MCP process targets the same editor and the default local
+command port is already in use, it should fall back to an ephemeral local port
+and report that in `connection_status`.
+
 ## Discovery preflight / doctor
 
 Run `preflight_discovery` before `discover_editors`/`connect_to_editor` when

@@ -48,11 +48,13 @@ def register(server, connection=None):
     @server.tool()
     async def connect_to_editor(node_id: str = None) -> list[TextContent]:
         """
-        Connect to a running Unreal Editor instance.
+        Connect this MCP process to a running Unreal Editor instance.
 
         Args:
             node_id: Optional node ID to connect to. If omitted, connects to
-                     the first discovered editor.
+                     the first discovered editor. Separate MCP server processes
+                     may connect to the same editor independently; this tool
+                     manages only the local process connection state.
         """
         conn = _conn()
         try:
@@ -79,7 +81,7 @@ def register(server, connection=None):
 
     @server.tool()
     async def connection_status() -> list[TextContent]:
-        """Return the current connection status to Unreal Editor."""
+        """Return the current per-process connection status to Unreal Editor."""
         conn = _conn()
         result = conn.get_status()
         return [TextContent(type="text", text=json.dumps(result, indent=2))]

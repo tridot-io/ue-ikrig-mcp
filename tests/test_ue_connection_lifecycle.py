@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import socket
 import types
 import unittest
 
@@ -455,6 +456,138 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertEqual(result["parsed"], {"ok": True})
         self.assertEqual(conn.execute_payload["node_id"], "win-node")
         self.assertEqual(conn.execute_payload["mode"], "ExecuteStatement")
+
+    def test_two_direct_connections_to_same_node_keep_distinct_local_ports_and_disconnect_isolated(self):
+        class LoopbackConnection(uc.UEConnection):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.peer_sockets = []
+
+            def _send_broadcast(self, msg):
+                if msg.type_ != uc._TYPE_OPEN_CONNECTION:
+                    return
+                peer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                peer.connect((msg.data["command_ip"], msg.data["command_port"]))
+                self.peer_sockets.append(peer)
+
+            def close_peers(self):
+                for peer in self.peer_sockets:
+                    try:
+                        peer.close()
+                    except OSError:
+                        pass
+                self.peer_sockets = []
+
+        port_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        port_probe.bind(("127.0.0.1", 0))
+        shared_port = port_probe.getsockname()[1]
+        port_probe.close()
+
+        first = LoopbackConnection(command_endpoint=("127.0.0.1", shared_port))
+        second = LoopbackConnection(command_endpoint=("127.0.0.1", shared_port))
+        try:
+            first._remote_node_id = "shared-node"
+            second._remote_node_id = "shared-node"
+
+            first._open_command_channel_with_fallback(
+                "shared-node",
+                accept_timeout=0.1,
+                attempts=1,
+            )
+            second._open_command_channel_with_fallback(
+                "shared-node",
+                accept_timeout=0.1,
+                attempts=1,
+            )
+
+            first_status = first.get_status()
+            second_status = second.get_status()
+
+            self.assertTrue(first_status["connected"])
+            self.assertTrue(second_status["connected"])
+            self.assertEqual(first_status["node_id"], "shared-node")
+            self.assertEqual(second_status["node_id"], "shared-node")
+            self.assertEqual(first_status["active_command_endpoint"], ["127.0.0.1", shared_port])
+            self.assertFalse(first_status["fallback_used"])
+            self.assertTrue(second_status["fallback_used"])
+            self.assertEqual(second_status["configured_command_endpoint"], ["127.0.0.1", shared_port])
+            self.assertNotEqual(second_status["active_command_endpoint"][1], shared_port)
+            self.assertEqual(first._last_callback_request["node_id"], "shared-node")
+            self.assertEqual(second._last_callback_request["node_id"], "shared-node")
+
+            second_active_endpoint = list(second_status["active_command_endpoint"])
+            first.disconnect()
+
+            second_after_disconnect = second.get_status()
+            self.assertTrue(second_after_disconnect["connected"])
+            self.assertEqual(second_after_disconnect["node_id"], "shared-node")
+            self.assertEqual(second_after_disconnect["active_command_endpoint"], second_active_endpoint)
+        finally:
+            first.disconnect()
+            second.disconnect()
+            first.close_peers()
+            second.close_peers()
+
+    def test_two_bridge_connections_to_same_node_keep_local_state_isolated(self):
+        class BridgeConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self.execute_payloads = []
+
+            def _windows_bridge_supported(self):
+                return True
+
+            def _run_windows_bridge(self, payload, timeout=10.0):
+                if payload["op"] == "discover":
+                    return {
+                        "ok": True,
+                        "nodes": [{
+                            "node_id": "shared-node",
+                            "project_name": "ProjectAvadot",
+                        }],
+                    }
+                if payload["op"] == "execute":
+                    self.execute_payloads.append(dict(payload))
+                    return {
+                        "ok": True,
+                        "result": {
+                            "success": True,
+                            "result": "None",
+                            "output": "__MCP_RESULT__{\"ok\": true}",
+                        },
+                    }
+                raise AssertionError(payload)
+
+        first = BridgeConnection()
+        second = BridgeConnection()
+        try:
+            first.connect()
+            second.connect()
+
+            self.assertTrue(first.is_connected())
+            self.assertTrue(second.is_connected())
+            self.assertEqual(first.get_connected_node_id(), "shared-node")
+            self.assertEqual(second.get_connected_node_id(), "shared-node")
+
+            self.assertTrue(first.execute("print('first')")["success"])
+            self.assertTrue(second.execute("print('second')")["success"])
+
+            first.disconnect()
+
+            second_status = second.get_status()
+            self.assertTrue(second_status["connected"])
+            self.assertTrue(second_status["windows_bridge"]["connected"])
+            self.assertEqual(second_status["node_id"], "shared-node")
+
+            after_disconnect = second.execute("print('after disconnect')")
+            self.assertTrue(after_disconnect["success"])
+            self.assertEqual(
+                [payload["node_id"] for payload in second.execute_payloads],
+                ["shared-node", "shared-node"],
+            )
+        finally:
+            first.disconnect()
+            second.disconnect()
 
     def test_direct_execute_uses_bounded_socket_timeout_for_stalled_editor(self):
         class SilentCommandSocket:

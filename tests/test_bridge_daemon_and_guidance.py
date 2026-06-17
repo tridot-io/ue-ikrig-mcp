@@ -127,6 +127,36 @@ class WindowsBridgeDaemonTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIsNone(self.conn._bridge_daemon)
 
+    def test_two_connections_get_independent_daemons_and_one_disconnect_does_not_stop_the_other(self):
+        other = uc.UEConnection()
+        try:
+            first = self.conn._run_windows_bridge({"op": "ping"}, timeout=15)
+            second = other._run_windows_bridge({"op": "ping"}, timeout=15)
+
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertNotEqual(
+                first["_bridge_process"]["pid"],
+                second["_bridge_process"]["pid"],
+                "independent UEConnection instances should own separate bridge daemons",
+            )
+            self.assertIsNotNone(self.conn._bridge_daemon)
+            self.assertIsNotNone(other._bridge_daemon)
+            self.assertNotEqual(self.conn._bridge_daemon, other._bridge_daemon)
+
+            self.conn.disconnect()
+            self.assertIsNone(self.conn._bridge_daemon)
+
+            third = other._run_windows_bridge({"op": "ping"}, timeout=15)
+            self.assertTrue(third["ok"])
+            self.assertEqual(
+                second["_bridge_process"]["pid"],
+                third["_bridge_process"]["pid"],
+                "disconnecting one connection must not tear down another connection's bridge daemon",
+            )
+        finally:
+            other.disconnect()
+
 
 class BridgeNodeCacheTests(unittest.TestCase):
     def _make_counting_connection(self):
