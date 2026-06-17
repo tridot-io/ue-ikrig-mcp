@@ -73,10 +73,10 @@ ue-ikrig-mcp
 
 ### Connection (5)
 - `preflight_discovery` - Deterministic UDP ping/pong and optional TCP callback diagnostic
-- `discover_editors` - Find running UE Editor instances
-- `connect_to_editor` - Open command channel to an editor
+- `discover_editors` - Find running UE Editor instances; the response may contain multiple selectable `node_id`s
+- `connect_to_editor` - Open this MCP process's single active command channel to one selected editor (`node_id` required when discovery is ambiguous)
 - `disconnect_editor` - Close the command/discovery sockets held by this MCP process
-- `connection_status` - Check connection state
+- `connection_status` - Check connection state, including the active `node_id`, discovered nodes, and whether selection is required
 
 ### IK Rig (10)
 - `create_ik_rig` - Create new IK Rig asset
@@ -140,6 +140,46 @@ does **not** mean one MCP process can hold multiple active editor connections at
 once. When a second MCP process targets the same editor and the default local
 command port is already in use, it should fall back to an ephemeral local port
 and report that in `connection_status`.
+
+### Discover many, connect one
+
+`discover_editors` is a discovery tool: it can return every visible Unreal
+Editor node for the current direct UDP or Windows-bridge transport. Use the
+returned `node_id` values to choose the target editor explicitly.
+
+`connect_to_editor` is a selection tool: one MCP server process keeps exactly
+one active editor connection at a time. When more than one editor is discovered
+and no still-valid active editor is already selected, omitting `node_id` is
+ambiguous. Instead of silently choosing the first editor, the tool reports the
+stable ambiguity signal:
+
+```json
+{
+  "error": true,
+  "error_code": "MULTIPLE_EDITORS_DISCOVERED",
+  "classification": "MULTIPLE_EDITORS_DISCOVERED",
+  "message": "Multiple Unreal Editor instances were discovered. Retry with node_id.",
+  "nodes": [
+    {
+      "node_id": "...",
+      "project_name": "...",
+      "_transport": "direct_udp|windows_subprocess"
+    }
+  ],
+  "next_action": "Call connect_to_editor(node_id=<one of nodes[].node_id>)."
+}
+```
+
+Retry with `connect_to_editor(node_id="<chosen node_id>")` to bind this MCP
+process to one editor. Selecting a different `node_id` later switches the
+process to that editor; it does not create a second active session.
+
+If `connection_status` already shows a still-valid active editor, a later
+`connect_to_editor()` call with omitted `node_id` is idempotent: it reuses the
+current active editor even when discovery can see additional editors. Status
+responses distinguish the active selection from discovery inventory with fields
+such as `connected`, `node_id`, `discovered_nodes`, `selection_required`, and
+`one_active_editor_per_process`.
 
 ## Discovery preflight / doctor
 
@@ -253,6 +293,10 @@ Windows-bridge nodes are rediscovered. The `connection_liveness` field records
 the probe result, and stale transports are cleared instead of being reported as
 connected. It also reports the loaded package version/source file under
 `package` and the selected bridge launcher under `windows_bridge.launcher`.
+For multi-editor sessions, check the active `node_id` separately from
+`discovered_nodes`: `selection_required=true` means discovery found more than
+one editor and the next connect must name a `node_id`; `selection_required=false`
+with `connected=true` means this MCP process has one active editor selected.
 Check these fields when `uvx` appears to be running stale code, when the bridge
 is not using the expected Windows Python, or when a previously connected editor
 has disappeared.

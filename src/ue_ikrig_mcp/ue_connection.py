@@ -52,6 +52,7 @@ TYPE_COMMAND = "command"
 TYPE_COMMAND_RESULT = "command_result"
 BUFFER_SIZE = 8192
 RESULT_PREFIX = "__UE_IKRIG_MCP_BRIDGE_RESULT__"
+MULTIPLE_EDITORS_ERROR_CODE = "MULTIPLE_EDITORS_DISCOVERED"
 
 # Persistent daemon state: one bridge process can keep TCP command channels
 # open to editor nodes across many requests.
@@ -254,8 +255,21 @@ def recv_json_message(conn, timeout):
     return json.loads(data.decode("utf-8"))
 
 
+def multiple_editors_payload(nodes):
+    return {
+        "ok": False,
+        "error": True,
+        "error_code": MULTIPLE_EDITORS_ERROR_CODE,
+        "classification": MULTIPLE_EDITORS_ERROR_CODE,
+        "message": "Multiple Unreal Editor instances were discovered. Retry with node_id.",
+        "nodes": [dict(node) for node in nodes],
+        "next_action": "Call connect_to_editor(node_id=<one of nodes[].node_id>).",
+        "delivered": False,
+    }
+
+
 def resolve_node_id(payload):
-    """Return (node_id, error_dict). Discovers the first editor when unset."""
+    """Return (node_id, error_dict). Requires explicit selection when ambiguous."""
     node_id = payload.get("node_id")
     if node_id:
         return node_id, None
@@ -268,14 +282,17 @@ def resolve_node_id(payload):
         "source_id": payload.get("source_id"),
         "targets": payload.get("targets"),
     })
-    if not discovery.get("nodes"):
+    nodes = discovery.get("nodes") or []
+    if not nodes:
         return None, {
             "ok": False,
             "error": "No Unreal Editor instances discovered from Windows bridge.",
             "discovery": discovery,
             "delivered": False,
         }
-    return discovery["nodes"][0]["node_id"], None
+    if len(nodes) > 1:
+        return None, multiple_editors_payload(nodes)
+    return nodes[0]["node_id"], None
 
 
 def open_command_channel(payload, node_id):
@@ -1346,6 +1363,9 @@ DISCOVERY_SETTLE_SECONDS = max(0.0, _float_env('UE_DISCOVERY_SETTLE', 0.25))
 SCRIPT_PREFLIGHT_ENABLED = _bool_env('UE_SCRIPT_PREFLIGHT', True)
 
 _MCP_RESULT_SENTINEL = '__MCP_RESULT__'
+MULTIPLE_EDITORS_ERROR_CODE = 'MULTIPLE_EDITORS_DISCOVERED'
+MULTIPLE_EDITORS_MESSAGE = 'Multiple Unreal Editor instances were discovered. Retry with node_id.'
+MULTIPLE_EDITORS_NEXT_ACTION = 'Call connect_to_editor(node_id=<one of nodes[].node_id>).'
 
 logger = logging.getLogger(__name__)
 
@@ -1356,6 +1376,34 @@ class UENotRunningError(Exception):
 
 class UEConnectionError(Exception):
     """Raised when a connection attempt to Unreal Editor fails."""
+
+
+class UEMultipleEditorsAmbiguousError(Exception):
+    """Raised when omitted node_id cannot safely choose among discovered editors."""
+
+    error_code = MULTIPLE_EDITORS_ERROR_CODE
+    classification = MULTIPLE_EDITORS_ERROR_CODE
+
+    def __init__(
+        self,
+        nodes: list[dict[str, Any]],
+        message: str = MULTIPLE_EDITORS_MESSAGE,
+        next_action: str = MULTIPLE_EDITORS_NEXT_ACTION,
+    ):
+        self.nodes = [dict(node) for node in nodes]
+        self.message = message
+        self.next_action = next_action
+        super().__init__(message)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            'error': True,
+            'error_code': self.error_code,
+            'classification': self.classification,
+            'message': self.message,
+            'nodes': [dict(node) for node in self.nodes],
+            'next_action': self.next_action,
+        }
 
 
 def is_local_bind_error(error: BaseException) -> bool:
@@ -1428,6 +1476,7 @@ class _NodeSet:
             for node_id, (data, last_pong) in self._nodes.items():
                 entry = dict(data)
                 entry['node_id'] = node_id
+                entry.setdefault('_transport', 'direct_udp')
                 result.append(entry)
             return result
 
@@ -2432,17 +2481,55 @@ class UEConnection:
             return EDITOR_BUSY_MESSAGE
         return 'No Unreal Editor instances discovered within timeout.'
 
+    def _resolve_connect_node_id(
+        self,
+        node_id: Optional[str],
+        nodes: list[dict[str, Any]],
+    ) -> Optional[str]:
+        """Resolve a connect target without guessing among multiple editors."""
+        if node_id is not None:
+            requested = str(node_id)
+            if nodes and not any(str(node.get('node_id')) == requested for node in nodes):
+                available = ', '.join(str(node.get('node_id')) for node in nodes if node.get('node_id'))
+                raise UEConnectionError(
+                    f'Unreal Editor node {requested!r} was not discovered.'
+                    + (f' Available nodes: {available}.' if available else '')
+                )
+            return requested
+
+        if not nodes:
+            return None
+        if len(nodes) == 1:
+            return str(nodes[0]['node_id'])
+        raise UEMultipleEditorsAmbiguousError(nodes)
+
+    def _snapshot_discovered_nodes(self) -> list[dict[str, Any]]:
+        """Return known direct/bridge discovery nodes without forcing a new probe."""
+        by_id: dict[str, dict[str, Any]] = {}
+        for node in self._nodes.remote_nodes:
+            node_id = node.get('node_id')
+            if node_id:
+                by_id[str(node_id)] = dict(node)
+        for node in self._windows_bridge_nodes:
+            node_id = node.get('node_id')
+            if node_id and str(node_id) not in by_id:
+                by_id[str(node_id)] = dict(node)
+        return list(by_id.values())
+
     def connect(self, node_id: Optional[str] = None, timeout: float = 5.0) -> None:
         """
         Connect to a discovered Unreal Editor node.
 
         Args:
-            node_id: Specific node ID to connect to. If None, uses the first
-                     discovered node (waiting up to `timeout` seconds).
+            node_id: Specific node ID to connect to. If omitted, a single
+                     discovered node may be selected implicitly, but multiple
+                     discovered editors require explicit selection.
             timeout: Seconds to wait for node discovery if node_id is None.
 
         Raises:
             UENotRunningError: No editor nodes found within timeout.
+            UEMultipleEditorsAmbiguousError: More than one editor was discovered
+                and node_id was omitted.
             UEConnectionError: TCP handshake with the editor failed.
         """
         if self.is_connected():
@@ -2457,7 +2544,7 @@ class UEConnection:
             if node_id is None:
                 bridge_nodes = self.get_remote_nodes()
                 if bridge_nodes:
-                    node_id = bridge_nodes[0]['node_id']
+                    node_id = self._resolve_connect_node_id(None, bridge_nodes)
             elif self._discover_and_activate_windows_bridge_node(node_id):
                 return
             if self._activate_windows_bridge_node(node_id):
@@ -2476,7 +2563,10 @@ class UEConnection:
             while time.time() < deadline:
                 nodes = self.get_remote_nodes()
                 if nodes:
-                    node_id = nodes[0]['node_id']
+                    if len(nodes) == 1 and DISCOVERY_SETTLE_SECONDS > 0:
+                        time.sleep(min(DISCOVERY_SETTLE_SECONDS, max(0.0, deadline - time.time())))
+                        nodes = self.get_remote_nodes()
+                    node_id = self._resolve_connect_node_id(None, nodes)
                     break
                 time.sleep(0.2)
             if node_id is None:
@@ -2674,6 +2764,8 @@ class UEConnection:
                 self._bridge_execute_payload(code, mode, command_timeout),
                 timeout=command_timeout + 5.0,
             )
+            if result.get('error_code') == MULTIPLE_EDITORS_ERROR_CODE:
+                raise UEMultipleEditorsAmbiguousError(result.get('nodes') or [])
             # First call after an editor restart hits a pinned node that no
             # longer exists: the channel handshake never completes, so the
             # command provably never ran (delivered is False). Rediscover the
@@ -2688,6 +2780,8 @@ class UEConnection:
                     self._bridge_execute_payload(code, mode, command_timeout),
                     timeout=command_timeout + 5.0,
                 )
+                if result.get('error_code') == MULTIPLE_EDITORS_ERROR_CODE:
+                    raise UEMultipleEditorsAmbiguousError(result.get('nodes') or [])
             if not result.get('ok'):
                 self._windows_bridge_connected = False
                 self._mark_transport_disconnected()
@@ -3011,9 +3105,18 @@ class UEConnection:
             self._multicast_group[0],
             is_wsl=wsl_detected,
         )
+        discovered_nodes = self._snapshot_discovered_nodes()
+        connected_node_id = self.get_connected_node_id()
+        selection_required = bool(not self.is_connected() and len(discovered_nodes) > 1)
         status = {
             'connected': self.is_connected(),
-            'node_id': self.get_connected_node_id(),
+            'node_id': connected_node_id,
+            'active_node_id': connected_node_id,
+            'discovered_nodes': discovered_nodes,
+            'selection_required': selection_required,
+            'selection_error_code': MULTIPLE_EDITORS_ERROR_CODE if selection_required else None,
+            'selection_next_action': MULTIPLE_EDITORS_NEXT_ACTION if selection_required else None,
+            'one_active_editor_per_process': True,
             'configured_command_endpoint': list(self._configured_command_endpoint),
             'active_command_endpoint': list(self._active_command_endpoint),
             'fallback_used': self._fallback_used,

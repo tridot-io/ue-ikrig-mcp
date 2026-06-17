@@ -7,7 +7,12 @@ output echoed back into the driver's context.
 
 from typing import Any, Optional
 
-from .ue_connection import UENotRunningError, UEConnectionError, normalize_execution_mode
+from .ue_connection import (
+    UEMultipleEditorsAmbiguousError,
+    UENotRunningError,
+    UEConnectionError,
+    normalize_execution_mode,
+)
 
 # Prepended to every ExecuteFile-mode driver script (execute_python and
 # run_script) unless inject_helpers=False. Keep it small and side-effect free:
@@ -64,8 +69,8 @@ def prepare_user_code(code: str, mode: str, inject_helpers: bool) -> str:
     return EXECUTE_PYTHON_PRELUDE + "\n" + code
 
 
-def ensure_connected(conn) -> Optional[str]:
-    """Auto-connect a disconnected UEConnection. Returns an error message or None."""
+def ensure_connected(conn) -> Optional[str | dict[str, Any]]:
+    """Auto-connect a disconnected UEConnection. Returns an error payload/message or None."""
     if (
         hasattr(conn, "is_connected")
         and hasattr(conn, "connect")
@@ -73,6 +78,8 @@ def ensure_connected(conn) -> Optional[str]:
     ):
         try:
             conn.connect()
+        except UEMultipleEditorsAmbiguousError as e:
+            return e.to_payload()
         except (UENotRunningError, UEConnectionError) as e:
             return (
                 f"Auto-connect to Unreal Editor failed: {e} "

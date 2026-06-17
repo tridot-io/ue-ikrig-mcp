@@ -15,10 +15,22 @@ _SECTIONS["workflow"] = """\
 
 - `execute_python` auto-connects when no editor connection exists yet; other
   tools require `connect_to_editor` first.
+- `discover_editors` may return many Unreal Editor nodes. Discovery is inventory;
+  connection is selection. Keep one active editor per MCP process and choose the
+  target with `connect_to_editor(node_id=...)` when more than one editor is
+  visible.
+- If multiple editors are visible and no still-valid active editor is already
+  selected, omitted `node_id` is ambiguous. The expected structured signal is
+  `MULTIPLE_EDITORS_DISCOVERED` with `nodes` and `next_action`; retry with one
+  of the returned `nodes[].node_id` values.
+- If `connection_status` already shows a still-valid active `node_id`, an
+  omitted-`node_id` connect reuses that editor instead of creating a second
+  active session.
 - If anything transport-related fails, run `preflight_discovery` and follow its
   `next_action` instead of retrying `connect_to_editor`/`execute_python` blindly.
 - `connection_status` is cheap; use it to confirm the transport before a long
-  batch run.
+  batch run and to inspect `discovered_nodes`, `selection_required`, and the
+  active `node_id`.
 - One MCP call should carry one whole script. Loop **inside** the script
   (server-side) instead of issuing one MCP call per item - each call is a full
   editor round-trip.
@@ -226,6 +238,7 @@ Failed results include a `hints` list with classified guidance. Common cases:
 | SyntaxError reported locally | The script never reached Unreal; fix escaping (quotes, backslashes, f-string braces). |
 | Timeout | Editor still busy on the game thread - see the timeouts section. |
 | `parsed` is null on success | The script did not print the `__MCP_RESULT__` sentinel. |
+| `MULTIPLE_EDITORS_DISCOVERED` | More than one editor is visible and no active editor was selected - call `discover_editors`, then `connect_to_editor(node_id=...)`. |
 
 Diagnosis order for transport errors: `connection_status` ->
 `preflight_discovery` -> editor's Output Log (Python category).

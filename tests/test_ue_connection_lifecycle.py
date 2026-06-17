@@ -58,6 +58,14 @@ class _FakeConnection:
 
 
 class ConnectionLifecycleTests(unittest.TestCase):
+    def _assert_multiple_editors_payload(self, payload):
+        self.assertTrue(payload["error"])
+        self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual(payload["classification"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertIn("Multiple Unreal Editor instances", payload["message"])
+        self.assertIn("node_id", payload["next_action"])
+        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"])
+
     def test_address_list_helpers_split_and_dedupe(self):
         self.assertEqual(
             uc._split_address_list("127.0.0.1, 0.0.0.0;127.0.0.1", ["fallback"]),
@@ -208,6 +216,9 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertTrue(status["fallback_used"])
         self.assertEqual(status["fallback_reason"], "EADDRINUSE")
         self.assertEqual(status["discovery"]["multicast_group"], ["239.0.0.1", 6766])
+        self.assertEqual(status["discovered_nodes"], [])
+        self.assertFalse(status["selection_required"])
+        self.assertTrue(status["one_active_editor_per_process"])
         self.assertEqual(status["callback"]["advertised_host"], "127.0.0.1")
         self.assertIn("wsl_detected", status["callback"])
         self.assertIn("route_ipv4_to_multicast_group", status["network"])
@@ -414,6 +425,210 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertIn("win-node", conn._windows_bridge_node_ids)
         self.assertEqual(conn.bridge_payload["op"], "discover")
 
+    def test_get_remote_nodes_preserves_multiple_windows_bridge_nodes(self):
+        class BridgeConnection(uc.UEConnection):
+            def _windows_bridge_supported(self):
+                return True
+
+            def _run_windows_bridge(self, payload, timeout=10.0):
+                self.bridge_payload = payload
+                return {
+                    "ok": True,
+                    "nodes": [
+                        {"node_id": "node-a", "project_name": "ProjectA"},
+                        {"node_id": "node-b", "project_name": "ProjectB"},
+                    ],
+                }
+
+        conn = BridgeConnection()
+        conn._running = True
+
+        nodes = conn.get_remote_nodes()
+
+        self.assertEqual([node["node_id"] for node in nodes], ["node-a", "node-b"])
+        self.assertEqual([node["_transport"] for node in nodes], ["windows_subprocess", "windows_subprocess"])
+        self.assertEqual(conn._windows_bridge_node_ids, {"node-a", "node-b"})
+        self.assertEqual(conn.bridge_payload["op"], "discover")
+
+    def test_direct_connect_without_node_id_raises_multiple_editors_payload(self):
+        self.assertTrue(
+            hasattr(uc, "UEMultipleEditorsAmbiguousError"),
+            "UEConnection.connect must expose a dedicated multi-editor ambiguity exception",
+        )
+
+        class MultiNodeConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self._running = True
+
+            def _windows_bridge_supported(self):
+                return False
+
+            def get_remote_nodes(self):
+                return [
+                    {"node_id": "node-a", "project_name": "ProjectA"},
+                    {"node_id": "node-b", "project_name": "ProjectB"},
+                ]
+
+            def _open_command_channel_with_fallback(self, *args, **kwargs):
+                raise AssertionError("ambiguous no-node_id connect must not open a command channel")
+
+        with self.assertRaises(uc.UEMultipleEditorsAmbiguousError) as raised:
+            MultiNodeConnection().connect()
+
+        self._assert_multiple_editors_payload(raised.exception.to_payload())
+
+    def test_windows_bridge_connect_without_node_id_raises_multiple_editors_payload(self):
+        self.assertTrue(
+            hasattr(uc, "UEMultipleEditorsAmbiguousError"),
+            "UEConnection.connect must expose a dedicated multi-editor ambiguity exception",
+        )
+
+        class BridgeConnection(uc.UEConnection):
+            def _windows_bridge_supported(self):
+                return True
+
+            def _run_windows_bridge(self, payload, timeout=10.0):
+                if payload["op"] == "discover":
+                    return {
+                        "ok": True,
+                        "nodes": [
+                            {"node_id": "node-a", "project_name": "ProjectA"},
+                            {"node_id": "node-b", "project_name": "ProjectB"},
+                        ],
+                    }
+                raise AssertionError(payload)
+
+            def _open_command_channel_with_fallback(self, *args, **kwargs):
+                raise AssertionError("ambiguous bridge connect must not fall back to direct TCP")
+
+        with self.assertRaises(uc.UEMultipleEditorsAmbiguousError) as raised:
+            BridgeConnection().connect()
+
+        payload = raised.exception.to_payload()
+        self._assert_multiple_editors_payload(payload)
+        self.assertEqual([node["_transport"] for node in payload["nodes"]], ["windows_subprocess", "windows_subprocess"])
+
+    def test_explicit_node_id_selects_one_direct_node_from_many(self):
+        class MultiNodeConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self._running = True
+                self.opened_node_ids = []
+
+            def _windows_bridge_supported(self):
+                return False
+
+            def get_remote_nodes(self):
+                return [
+                    {"node_id": "node-a", "project_name": "ProjectA"},
+                    {"node_id": "node-b", "project_name": "ProjectB"},
+                ]
+
+            def _open_command_channel_with_fallback(self, node_id, *args, **kwargs):
+                self.opened_node_ids.append(node_id)
+
+        conn = MultiNodeConnection()
+
+        conn.connect(node_id="node-b")
+
+        self.assertEqual(conn._remote_node_id, "node-b")
+        self.assertEqual(conn.opened_node_ids, ["node-b"])
+
+    def test_already_connected_without_node_id_reuses_active_node_before_ambiguity_check(self):
+        class ConnectedMultiNodeConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self._remote_node_id = "node-a"
+                self.discovery_calls = 0
+                self.opened_node_ids = []
+
+            def is_connected(self):
+                return True
+
+            def _refresh_connection_liveness(self):
+                return {
+                    "transport": "direct_tcp",
+                    "ok": True,
+                    "state": "open",
+                    "node_id": self._remote_node_id,
+                }
+
+            def get_remote_nodes(self):
+                self.discovery_calls += 1
+                return [
+                    {"node_id": "node-a", "project_name": "ProjectA"},
+                    {"node_id": "node-b", "project_name": "ProjectB"},
+                ]
+
+            def _open_command_channel_with_fallback(self, node_id, *args, **kwargs):
+                self.opened_node_ids.append(node_id)
+
+        conn = ConnectedMultiNodeConnection()
+
+        conn.connect()
+
+        self.assertEqual(conn._remote_node_id, "node-a")
+        self.assertEqual(conn.discovery_calls, 0)
+        self.assertEqual(conn.opened_node_ids, [])
+
+    def test_connection_status_exposes_discovered_nodes_and_selection_required(self):
+        class StatusConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self._running = True
+                self._nodes.update("node-a", {"project_name": "ProjectA"})
+                self._nodes.update("node-b", {"project_name": "ProjectB"})
+
+            def _windows_bridge_supported(self):
+                return False
+
+            def _refresh_connection_liveness(self):
+                self._mark_transport_disconnected()
+                return {
+                    "transport": None,
+                    "ok": False,
+                    "state": "not_connected",
+                    "timeout_seconds": uc.CONNECTION_STATUS_TIMEOUT,
+                }
+
+        status = StatusConnection().get_status()
+
+        self.assertFalse(status["connected"])
+        self.assertIsNone(status["node_id"])
+        self.assertIs(status["one_active_editor_per_process"], True)
+        self.assertIs(status["selection_required"], True)
+        self.assertEqual([node["node_id"] for node in status["discovered_nodes"]], ["node-a", "node-b"])
+        self.assertEqual(status["selection_error_code"], "MULTIPLE_EDITORS_DISCOVERED")
+
+    def test_connection_status_suppresses_selection_required_for_active_reuse(self):
+        class ConnectedStatusConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self._remote_node_id = "node-a"
+                self._nodes.update("node-a", {"project_name": "ProjectA"})
+                self._nodes.update("node-b", {"project_name": "ProjectB"})
+
+            def is_connected(self):
+                return True
+
+            def _refresh_connection_liveness(self):
+                return {
+                    "transport": "direct_tcp",
+                    "ok": True,
+                    "state": "open",
+                    "node_id": "node-a",
+                    "timeout_seconds": uc.CONNECTION_STATUS_TIMEOUT,
+                }
+
+        status = ConnectedStatusConnection().get_status()
+
+        self.assertTrue(status["connected"])
+        self.assertEqual(status["node_id"], "node-a")
+        self.assertIs(status["one_active_editor_per_process"], True)
+        self.assertIs(status["selection_required"], False)
+        self.assertEqual([node["node_id"] for node in status["discovered_nodes"]], ["node-a", "node-b"])
+
     def test_connect_and_execute_can_use_windows_bridge_transport(self):
         class BridgeConnection(uc.UEConnection):
             def _windows_bridge_supported(self):
@@ -456,6 +671,115 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertEqual(result["parsed"], {"ok": True})
         self.assertEqual(conn.execute_payload["node_id"], "win-node")
         self.assertEqual(conn.execute_payload["mode"], "ExecuteStatement")
+
+    def test_connect_omitted_node_id_raises_ambiguity_for_direct_multi_node_discovery(self):
+        class DirectMultiNodeConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self.opened = []
+
+            def _windows_bridge_supported(self):
+                return False
+
+            def start_discovery(self):
+                self._running = True
+                self._nodes.update("node-a", {"project_name": "A"})
+                self._nodes.update("node-b", {"project_name": "B"})
+
+            def _windows_bridge_supported(self):
+                return False
+
+            def _open_command_channel_with_fallback(self, node_id, *args, **kwargs):
+                self.opened.append(node_id)
+
+        conn = DirectMultiNodeConnection()
+
+        with self.assertRaises(uc.UEMultipleEditorsAmbiguousError) as ctx:
+            conn.connect(timeout=0.05)
+
+        payload = ctx.exception.to_payload()
+        self.assertTrue(payload["error"])
+        self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual(payload["classification"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertIn("Retry with node_id", payload["message"])
+        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"])
+        self.assertEqual(
+            payload["next_action"],
+            "Call connect_to_editor(node_id=<one of nodes[].node_id>).",
+        )
+        self.assertEqual(conn.opened, [])
+
+        conn.connect(node_id="node-b", timeout=0.05)
+        self.assertEqual(conn.opened, ["node-b"])
+
+    def test_connect_omitted_node_id_raises_ambiguity_for_bridge_multi_node_discovery(self):
+        class BridgeMultiNodeConnection(uc.UEConnection):
+            def _windows_bridge_supported(self):
+                return True
+
+            def _run_windows_bridge(self, payload, timeout=10.0):
+                if payload["op"] == "discover":
+                    return {
+                        "ok": True,
+                        "nodes": [
+                            {"node_id": "win-a", "project_name": "A"},
+                            {"node_id": "win-b", "project_name": "B"},
+                        ],
+                    }
+                raise AssertionError(payload)
+
+            def start_discovery(self):
+                raise AssertionError("bridge ambiguity should be resolved before direct discovery")
+
+            def _open_command_channel_with_fallback(self, *args, **kwargs):
+                raise AssertionError("bridge nodes should not use direct callback")
+
+        conn = BridgeMultiNodeConnection()
+
+        with self.assertRaises(uc.UEMultipleEditorsAmbiguousError) as ctx:
+            conn.connect()
+
+        payload = ctx.exception.to_payload()
+        self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["win-a", "win-b"])
+        self.assertEqual(payload["nodes"][0]["_transport"], "windows_subprocess")
+
+        conn.connect(node_id="win-b")
+        self.assertTrue(conn.is_connected())
+        self.assertEqual(conn.get_connected_node_id(), "win-b")
+
+    def test_connect_omitted_node_id_reuses_valid_active_editor_before_ambiguity(self):
+        class ConnectedBridgeConnection(uc.UEConnection):
+            def _refresh_connection_liveness(self):
+                return {
+                    "transport": "windows_subprocess",
+                    "ok": True,
+                    "state": "test_connected",
+                    "node_id": self._remote_node_id,
+                }
+
+            def get_remote_nodes(self):
+                raise AssertionError("valid active editor must be reused before discovery")
+
+        conn = ConnectedBridgeConnection()
+        conn._windows_bridge_connected = True
+        conn._remote_node_id = "win-a"
+        conn._windows_bridge_nodes = [
+            {"node_id": "win-a", "project_name": "A", "_transport": "windows_subprocess"},
+            {"node_id": "win-b", "project_name": "B", "_transport": "windows_subprocess"},
+        ]
+        conn._windows_bridge_node_ids = {"win-a", "win-b"}
+
+        conn.connect()
+        status = conn.get_status()
+
+        self.assertEqual(conn.get_connected_node_id(), "win-a")
+        self.assertTrue(status["connected"])
+        self.assertEqual(status["node_id"], "win-a")
+        self.assertEqual(status["active_node_id"], "win-a")
+        self.assertFalse(status["selection_required"])
+        self.assertTrue(status["one_active_editor_per_process"])
+        self.assertEqual([node["node_id"] for node in status["discovered_nodes"]], ["win-a", "win-b"])
 
     def test_two_direct_connections_to_same_node_keep_distinct_local_ports_and_disconnect_isolated(self):
         class LoopbackConnection(uc.UEConnection):
@@ -1016,6 +1340,27 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertTrue(fake_conn.disconnected)
         self.assertTrue(payload["disconnected"])
         self.assertEqual(payload["previous"]["node_id"], "fake-node")
+
+    def test_connect_to_editor_preserves_multiple_editors_payload(self):
+        class AmbiguousConnection:
+            def connect(self, node_id=None):
+                raise uc.UEMultipleEditorsAmbiguousError([
+                    {"node_id": "node-a", "project_name": "A", "_transport": "direct_udp"},
+                    {"node_id": "node-b", "project_name": "B", "_transport": "direct_udp"},
+                ])
+
+            def get_status(self):
+                raise AssertionError("status should not run after ambiguity")
+
+        fake_server = _FakeServer()
+        connection_tools.register(fake_server, connection=AmbiguousConnection())
+
+        payload = json.loads(asyncio.run(fake_server.tools["connect_to_editor"]())[0].text)
+
+        self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual(payload["classification"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"])
+        self.assertNotIn("connected", payload)
 
     def test_preflight_discovery_tool_is_registered_and_forwards_options(self):
         fake_server = _FakeServer()

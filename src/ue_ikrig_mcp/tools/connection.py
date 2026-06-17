@@ -1,7 +1,12 @@
 import json
 from mcp.types import TextContent
 
-from ..ue_connection import get_connection, UENotRunningError, UEConnectionError
+from ..ue_connection import (
+    get_connection,
+    UEMultipleEditorsAmbiguousError,
+    UENotRunningError,
+    UEConnectionError,
+)
 
 
 def register(server, connection=None):
@@ -33,7 +38,12 @@ def register(server, connection=None):
 
     @server.tool()
     async def discover_editors() -> list[TextContent]:
-        """Discover running Unreal Editor instances on the local network."""
+        """Discover running Unreal Editor instances.
+
+        The result may contain multiple editor nodes. Each node has a stable
+        node_id plus metadata that callers can use to choose one target for this
+        MCP process with connect_to_editor(node_id=...).
+        """
         conn = _conn()
         nodes = conn.get_remote_nodes()
         if nodes:
@@ -51,15 +61,19 @@ def register(server, connection=None):
         Connect this MCP process to a running Unreal Editor instance.
 
         Args:
-            node_id: Optional node ID to connect to. If omitted, connects to
-                     the first discovered editor. Separate MCP server processes
-                     may connect to the same editor independently; this tool
-                     manages only the local process connection state.
+            node_id: Optional node ID to connect to. If omitted, an existing
+                     valid active editor is reused; otherwise a single discovered
+                     editor may be selected implicitly and multiple discovered
+                     editors return MULTIPLE_EDITORS_DISCOVERED. Separate MCP
+                     server processes may connect to the same editor independently;
+                     this tool manages only the local process connection state.
         """
         conn = _conn()
         try:
             conn.connect(node_id=node_id)
             result = conn.get_status()
+        except UEMultipleEditorsAmbiguousError as e:
+            result = e.to_payload()
         except UENotRunningError as e:
             result = {"connected": False, "error": str(e)}
         except UEConnectionError as e:

@@ -509,6 +509,37 @@ class RecvFramingTests(unittest.TestCase):
 
 
 class ExecutePythonAutoConnectTests(unittest.TestCase):
+    def _assert_multiple_editors_payload(self, payload):
+        self.assertTrue(payload["error"])
+        self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual(payload["classification"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertIn("Multiple Unreal Editor instances", payload["message"])
+        self.assertIn("node_id", payload["next_action"])
+        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"])
+
+    def _ambiguous_connection(self):
+        class MultiNodeConnection(uc.UEConnection):
+            def __init__(self):
+                super().__init__()
+                self._running = True
+
+            def _windows_bridge_supported(self):
+                return False
+
+            def get_remote_nodes(self):
+                return [
+                    {"node_id": "node-a", "project_name": "ProjectA"},
+                    {"node_id": "node-b", "project_name": "ProjectB"},
+                ]
+
+            def _open_command_channel_with_fallback(self, *args, **kwargs):
+                raise AssertionError("ambiguous auto-connect must not open a command channel")
+
+            def execute(self, code, mode="ExecuteFile", timeout=None):
+                raise AssertionError("execute must not run when auto-connect is ambiguous")
+
+        return MultiNodeConnection()
+
     def _run_execute_python(self, fake_conn):
         fake_server = _FakeServer()
         original_get_connection = batch_tools.get_connection
@@ -560,6 +591,32 @@ class ExecutePythonAutoConnectTests(unittest.TestCase):
 
         self.assertTrue(payload["error"])
         self.assertIn("preflight_discovery", payload["message"])
+
+    def test_auto_connect_ambiguity_payload_is_preserved(self):
+        class AmbiguousConnection:
+            def is_connected(self):
+                return False
+
+            def connect(self, node_id=None, timeout=5.0):
+                raise uc.UEMultipleEditorsAmbiguousError([
+                    {"node_id": "node-a", "project_name": "A", "_transport": "direct_udp"},
+                    {"node_id": "node-b", "project_name": "B", "_transport": "direct_udp"},
+                ])
+
+            def execute(self, code, mode="ExecuteFile", timeout=None):
+                raise AssertionError("execute must not run when editor selection is ambiguous")
+
+        payload = json.loads(self._run_execute_python(AmbiguousConnection())[0].text)
+
+        self.assertTrue(payload["error"])
+        self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual(payload["classification"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"])
+        self.assertEqual(
+            payload["next_action"],
+            "Call connect_to_editor(node_id=<one of nodes[].node_id>).",
+        )
+        self.assertFalse(payload["message"].startswith("Auto-connect to Unreal Editor failed"))
 
 
 class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
@@ -1067,6 +1124,31 @@ class ScriptStoreTests(unittest.TestCase):
         missing = self._call("run_script", "nope")
         self.assertTrue(missing["error"])
         self.assertIn("list_scripts", missing["message"])
+
+    def test_run_script_auto_connect_ambiguity_payload_is_preserved(self):
+        class AmbiguousConnection(_CapturingConnection):
+            def is_connected(self):
+                return False
+
+            def connect(self, node_id=None, timeout=5.0):
+                raise uc.UEMultipleEditorsAmbiguousError([
+                    {"node_id": "node-a", "project_name": "A", "_transport": "direct_udp"},
+                    {"node_id": "node-b", "project_name": "B", "_transport": "direct_udp"},
+                ])
+
+            def execute(self, code, mode="ExecuteFile", timeout=None):
+                raise AssertionError("execute must not run when editor selection is ambiguous")
+
+        fake_server = _FakeServer()
+        script_store_tools.register(fake_server, connection=AmbiguousConnection())
+        asyncio.run(fake_server.tools["save_script"]("probe", "mcp_result({'ok': True})"))
+
+        payload = json.loads(asyncio.run(fake_server.tools["run_script"]("probe"))[0].text)
+
+        self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual(payload["classification"], "MULTIPLE_EDITORS_DISCOVERED")
+        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"])
+        self.assertFalse(payload["message"].startswith("Auto-connect to Unreal Editor failed"))
 
 
 class _HarvestSimConn(_CapturingConnection):

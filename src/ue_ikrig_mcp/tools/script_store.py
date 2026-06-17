@@ -17,6 +17,7 @@ from mcp.types import TextContent
 
 from ..ue_connection import (
     get_connection,
+    UEMultipleEditorsAmbiguousError,
     UENotRunningError,
     UEConnectionError,
     _script_syntax_preflight,
@@ -37,6 +38,8 @@ def _ok(data) -> list[TextContent]:
 
 
 def _err(msg: str) -> list[TextContent]:
+    if isinstance(msg, dict):
+        return _ok(msg)
     return [TextContent(type="text", text=json.dumps({"error": True, "message": msg}, indent=2))]
 
 
@@ -166,6 +169,8 @@ def register(server, connection=None):
                 mode="ExecuteFile",
                 timeout=timeout_seconds,
             )
+        except UEMultipleEditorsAmbiguousError as e:
+            return _ok(e.to_payload())
         except UEConnectionError as e:
             return _err(str(e))
         if result is None:

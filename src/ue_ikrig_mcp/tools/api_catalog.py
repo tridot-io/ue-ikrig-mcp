@@ -13,6 +13,7 @@ from mcp.types import TextContent
 from .. import api_index
 from ..ue_connection import (
     get_connection,
+    UEMultipleEditorsAmbiguousError,
     UENotRunningError,
     UEConnectionError,
     _wsl_path_to_windows,
@@ -28,6 +29,8 @@ def _ok(data) -> list[TextContent]:
 
 
 def _err(msg: str) -> list[TextContent]:
+    if isinstance(msg, dict):
+        return _ok(msg)
     return [TextContent(type="text", text=json.dumps({"error": True, "message": msg}, indent=2))]
 
 
@@ -45,6 +48,8 @@ def _build_catalog(conn, force: bool, timeout_seconds: float) -> tuple[bool, dic
     path in search/describe. Returns (success, response_payload)."""
     try:
         version_result = conn.execute(api_index.ENGINE_VERSION_SCRIPT)
+    except UEMultipleEditorsAmbiguousError as e:
+        return False, e.to_payload()
     except UEConnectionError as e:
         return False, {"error": True, "message": str(e)}
     parsed = version_result.get("parsed") or {}
@@ -65,6 +70,8 @@ def _build_catalog(conn, force: bool, timeout_seconds: float) -> tuple[bool, dic
             api_index.build_harvest_script(target_windows),
             timeout=timeout_seconds,
         )
+    except UEMultipleEditorsAmbiguousError as e:
+        return False, e.to_payload()
     except UEConnectionError as e:
         return False, {"error": True, "message": str(e)}
     harvest_parsed = harvest_result.get("parsed") or {}
