@@ -466,8 +466,10 @@ def daemon_execute(payload):
     except socket.timeout as exc:
         # The editor may still be running the command on its game thread;
         # never re-send it. Drop the channel so the next call starts clean.
+        # The structured timed_out flag lets the broker's gate classify this
+        # may-still-be-running timeout WITHOUT substring-matching the message.
         drop_channel(node_id)
-        return {"ok": False, "error": "Command timed out: %s" % (exc,)}
+        return {"ok": False, "error": "Command timed out: %s" % (exc,), "timed_out": True}
     except ChannelNotDelivered as exc:
         # The send itself failed, so nothing (complete) reached Unreal: safe to
         # retry. On a fresh channel, tell the client it may rediscover+retry;
@@ -500,8 +502,9 @@ def daemon_execute(payload):
     try:
         return run_command(channel, payload, node_id)
     except socket.timeout as exc:
+        # May still be running: structured timed_out flag (see above).
         drop_channel(node_id)
-        return {"ok": False, "error": "Command timed out: %s" % (exc,)}
+        return {"ok": False, "error": "Command timed out: %s" % (exc,), "timed_out": True}
     except (OSError, ValueError) as exc:
         drop_channel(node_id)
         return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
@@ -732,7 +735,7 @@ def _read_resolv_nameserver(path: str = '/etc/resolv.conf') -> Optional[str]:
                     if value:
                         return value
     except OSError:
-        return None
+        pass
     return None
 
 
@@ -1237,7 +1240,7 @@ def _script_syntax_preflight(code: str, mode: str) -> Optional[dict[str, Any]]:
         }
     except ValueError:
         # Source containing null bytes etc. — let Unreal report it.
-        return None
+        pass
     return None
 
 
@@ -1361,6 +1364,16 @@ WINDOWS_BRIDGE_EMPTY_NODE_TTL = max(0.0, _float_env('UE_BRIDGE_EMPTY_CACHE_TTL',
 DISCOVERY_SETTLE_SECONDS = max(0.0, _float_env('UE_DISCOVERY_SETTLE', 0.25))
 # Local syntax check before shipping scripts to Unreal.
 SCRIPT_PREFLIGHT_ENABLED = _bool_env('UE_SCRIPT_PREFLIGHT', True)
+# Auto-spawned shared editor-command broker (Option E2). When enabled on the
+# native (non-WSL) path, the two native open_connection issuers — direct-UDP
+# execute and the preflight handshake — funnel through one detached broker that
+# serializes every agent via result-frame-gated dispatch (see broker.py and
+# .omc/plans/multi-process-command-slot-arbitration.md). The broker is the fix
+# for cross-process editor-slot contention; WSL keeps the legacy bridge instead
+# (the broker targets the native direct path). If no broker can be reached or
+# spawned, connect() falls back to today's per-process direct command channel and
+# get_status() surfaces broker.available == False (never a silent no-op).
+BROKER_ENABLED = _bool_env('UE_BROKER', True)
 
 _MCP_RESULT_SENTINEL = '__MCP_RESULT__'
 MULTIPLE_EDITORS_ERROR_CODE = 'MULTIPLE_EDITORS_DISCOVERED'
@@ -1501,6 +1514,13 @@ class _WindowsBridgeDaemon:
     Windows Python interpreter warm and holds persistent TCP command channels
     to editor nodes, so repeated execute calls skip both the process spawn and
     the UDP open_connection handshake.
+
+    LEGACY (Option E2 / Phase E0): the bridge is retained as the WSL-only
+    transport (it is gated behind ``_is_wsl()`` in ``_windows_bridge_supported``
+    and is already structurally inactive on native Windows). On native Windows
+    the supported primary transport is the direct command channel funneled
+    through the shared broker (see ``broker.py``). Removing the bridge entirely
+    is a deferred follow-up; until then it serves WSL only.
     """
 
     def __init__(self, command: list[str], diagnostics: dict[str, Any]):
@@ -1746,6 +1766,14 @@ class UEConnection:
         self._last_windows_bridge_result: Optional[dict[str, Any]] = None
         self._bridge_daemon: Optional[_WindowsBridgeDaemon] = None
         self._bridge_daemon_cooldowns: dict[tuple[str, ...], float] = {}
+        # Shared editor-command broker (Option E2). _broker_client is a thin
+        # persistent loopback client to a detached broker that owns the single
+        # editor command channel; None when the broker path is off, unavailable,
+        # or this process fell back to its own direct command channel.
+        self._broker_client: Optional['Any'] = None
+        self._broker_connected = False
+        self._broker_unavailable_reason: Optional[str] = None
+        self._last_broker_status: Optional[dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Discovery
@@ -1956,6 +1984,109 @@ class UEConnection:
             return False
         launcher, _diagnostics = _windows_bridge_launcher()
         return bool(launcher)
+
+    def _broker_supported(self) -> bool:
+        """Return True when this process should route through the shared broker.
+
+        The broker owns the NATIVE direct command channel and serializes agents
+        machine-wide. WSL keeps the legacy Windows bridge instead (the broker
+        targets the native direct path, which on WSL is not the primary
+        transport), so the broker is gated off under WSL. Disabled via UE_BROKER.
+        """
+        return bool(BROKER_ENABLED and not _is_wsl())
+
+    def _try_connect_broker(self) -> bool:
+        """Obtain a thin-client connection to the shared broker (auto-spawning a
+        detached one if needed). Returns True when connected; on any failure the
+        caller falls back to the per-process direct command channel and the
+        reason is recorded for get_status() (never a silent no-op)."""
+        if not self._broker_supported():
+            self._broker_unavailable_reason = (
+                'disabled' if not BROKER_ENABLED else 'wsl_uses_bridge'
+            )
+            return False
+        reasons: list[str] = []
+        try:
+            from . import broker as broker_mod
+            client = broker_mod.connect_or_spawn(reasons=reasons)
+        except Exception as exc:  # import/transport failure -> fall back cleanly
+            self._broker_unavailable_reason = f'{type(exc).__name__}: {exc}'
+            self._broker_client = None
+            self._broker_connected = False
+            return False
+        if client is None:
+            # Surface the concrete spawn/election failure reason (broadened catch
+            # in spawn_detached_broker appends it) instead of a generic label.
+            self._broker_unavailable_reason = (
+                reasons[-1] if reasons else 'no_broker_reachable_or_spawnable'
+            )
+            self._broker_client = None
+            self._broker_connected = False
+            return False
+        self._broker_client = client
+        self._broker_connected = True
+        self._broker_unavailable_reason = None
+        return True
+
+    def _broker_request(self, payload: dict[str, Any], timeout: float) -> Optional[dict[str, Any]]:
+        """Send one request to the broker; None on a dead client."""
+        client = self._broker_client
+        if client is None:
+            return None
+        return client.request(payload, timeout=timeout)
+
+    def _connect_via_broker(self, node_id: Optional[str], timeout: float) -> bool:
+        """Connect through the shared broker and pin a target editor node.
+
+        Returns True on success (this UEConnection is now broker-backed). Returns
+        False to let connect() fall back to the per-process direct path; the
+        broker-unavailable reason is recorded for get_status(). Raises
+        UENotRunningError only when the broker is reachable but the editor is
+        genuinely absent (mirrors the direct path's no-nodes contract), so a
+        reachable broker over a missing editor is not silently masked.
+
+        Retargeting (connect to a different node while already broker-backed)
+        reuses the live client and only re-pins the node — the broker serves any
+        node, so there is no reconnect/respawn churn.
+        """
+        if not (self._broker_connected and self._broker_client is not None):
+            if not self._try_connect_broker():
+                return False
+        # The broker owns discovery; resolve a concrete node so connect()'s
+        # node-pinning semantics (and retarget) keep working unchanged.
+        if node_id is None:
+            discovery = self._broker_request({
+                'op': 'discover',
+                'group': list(self._multicast_group),
+                'ttl': max(1, int(self._multicast_ttl)),
+                'timeout': min(max(0.1, timeout), 5.0),
+                'settle': DISCOVERY_SETTLE_SECONDS,
+            }, timeout=max(2.0, timeout + 2.0))
+            if discovery is None:
+                # Broker died during discovery: drop it and fall back.
+                self._teardown_broker_client()
+                self._broker_unavailable_reason = 'broker_died_during_discover'
+                return False
+            nodes = discovery.get('nodes') or []
+            if not nodes:
+                # Broker reachable but no editor: same contract as the direct
+                # path. Keep the broker client (it is healthy) and raise.
+                raise UENotRunningError(self._no_nodes_error())
+            node_id = nodes[0].get('node_id')
+            if not node_id:
+                raise UENotRunningError(self._no_nodes_error())
+        self._remote_node_id = node_id
+        return True
+
+    def _teardown_broker_client(self) -> None:
+        client = self._broker_client
+        self._broker_client = None
+        self._broker_connected = False
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _ensure_bridge_daemon(
         self,
@@ -2550,6 +2681,16 @@ class UEConnection:
             if self._activate_windows_bridge_node(node_id):
                 return
 
+        # Native primary path (Option E2): funnel the direct command channel
+        # through the shared broker so concurrent agents are serialized by
+        # result-frame-gated dispatch instead of each opening a private channel
+        # (the cross-process steal-storm + overlapping-mutation bug). The broker
+        # owns discovery and the channel; on any failure we fall through to the
+        # per-process direct path below (recorded for get_status, never silent).
+        if self._broker_supported():
+            if self._connect_via_broker(node_id, timeout):
+                return
+
         if not self._running:
             try:
                 self.start_discovery()
@@ -2755,6 +2896,9 @@ class UEConnection:
                 '(or connect() when driving UEConnection directly).'
             )
 
+        if self._broker_connected:
+            return self._execute_via_broker(code, mode, timeout)
+
         if self._windows_bridge_connected:
             command_timeout = max(
                 0.1,
@@ -2858,6 +3002,85 @@ class UEConnection:
         result_data = response.data or {}
         return _normalize_command_result(result_data)
 
+    def _execute_via_broker(self, code: str, mode: str, timeout: Optional[float]) -> dict:
+        """Run one command through the shared broker (Option E2 native path).
+
+        Mirrors the bridge-execute discipline: the broker runs daemon_execute
+        VERBATIM (no-double-execute), so this client NEVER resends after a send.
+        The only retry is the bridge's: when the broker reports the command
+        provably never reached the editor (delivered is False — a stale pinned
+        node after an editor restart), rediscover and retry ONCE. Every other
+        failure (timeout, post-send error, broker_busy backpressure) is surfaced,
+        never resent.
+        """
+        command_timeout = max(
+            0.1,
+            float(WINDOWS_BRIDGE_EXEC_TIMEOUT if timeout is None else timeout),
+        )
+        payload = self._bridge_execute_payload(code, mode, command_timeout)
+        result = self._broker_request(payload, timeout=command_timeout + 5.0)
+        if result is None:
+            # The broker connection died with the command's fate unknown (it may
+            # have executed). NEVER resend; drop the broker client and surface.
+            self._teardown_broker_client()
+            self._mark_transport_disconnected()
+            raise UEConnectionError(
+                'Broker connection lost during command execution; the editor '
+                'state is unknown and the command was not resent.'
+            )
+        self._last_broker_status = None
+        # delivered is False ⇒ the command provably never reached the editor
+        # (e.g. the pinned node died). Rediscover the current editor and retry
+        # once — the same provably-never-ran recovery the bridge path uses.
+        # broker_busy (backpressure) and broker_poisoned (a contended slot whose
+        # prior command may still be running) ALSO carry delivered=False, but an
+        # auto-retry there would only re-hit the same condition — surface those
+        # to the caller instead of churning.
+        if (
+            not result.get('ok')
+            and result.get('delivered') is False
+            and not result.get('broker_busy')
+            and not result.get('broker_poisoned')
+            and self._reconnect_after_restart_broker()
+        ):
+            payload = self._bridge_execute_payload(code, mode, command_timeout)
+            retry = self._broker_request(payload, timeout=command_timeout + 5.0)
+            if retry is not None:
+                result = retry
+        if not result.get('ok'):
+            error_text = str(result.get('error', 'unknown error'))
+            guidance = _TIMEOUT_GUIDANCE if 'timed out' in error_text.lower() else ''
+            raise UEConnectionError(
+                f'Broker command execution failed: {error_text}{guidance}'
+            )
+        return _normalize_command_result(result.get('result') or {})
+
+    def _reconnect_after_restart_broker(self) -> bool:
+        """Re-pin the current editor through the broker after a provable restart.
+
+        Called only when the last command provably never ran (delivered False),
+        so re-running it is safe. Forces a fresh broker discovery and re-pins the
+        node; the broker process and client connection are kept (only the pinned
+        node changes). Returns True when a node was re-pinned."""
+        self._remote_node_id = None
+        if self._broker_client is None or not self._broker_connected:
+            return False
+        discovery = self._broker_request({
+            'op': 'discover',
+            'group': list(self._multicast_group),
+            'ttl': max(1, int(self._multicast_ttl)),
+            'timeout': 5.0,
+            'settle': DISCOVERY_SETTLE_SECONDS,
+        }, timeout=10.0)
+        if discovery is None:
+            self._teardown_broker_client()
+            return False
+        nodes = discovery.get('nodes') or []
+        if not nodes or not nodes[0].get('node_id'):
+            return False
+        self._remote_node_id = nodes[0]['node_id']
+        return True
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -2867,12 +3090,18 @@ class UEConnection:
         if (
             self._remote_node_id
             and not self._windows_bridge_connected
+            and not self._broker_connected
             and (self._broadcast_socket or self._broadcast_sockets)
         ):
             try:
                 self._send_broadcast(_Message(_TYPE_CLOSE_CONNECTION, self._node_id, self._remote_node_id))
             except Exception:
                 pass
+        # Close only THIS process's thin client. The broker is shared,
+        # detached infrastructure: it self-terminates on last-client-disconnect
+        # + grace, so disconnect() must never tear down the broker process (that
+        # would yank the editor slot out from under peer agents).
+        self._teardown_broker_client()
         self._cleanup_command_sockets()
         if self._bridge_daemon is not None:
             try:
@@ -2900,6 +3129,8 @@ class UEConnection:
         self._windows_bridge_node_ids = set()
         self._windows_bridge_nodes = []
         self._windows_bridge_nodes_at = 0.0
+        self._broker_unavailable_reason = None
+        self._last_broker_status = None
 
     def _cleanup_command_sockets(self) -> None:
         if self._command_channel_socket:
@@ -2916,15 +3147,23 @@ class UEConnection:
             self._command_listen_socket = None
 
     def is_connected(self) -> bool:
-        """Return True if a TCP command channel is open."""
-        return self._windows_bridge_connected or self._command_channel_socket is not None
+        """Return True if a command transport (broker, bridge, or direct) is open."""
+        return (
+            self._broker_connected
+            or self._windows_bridge_connected
+            or self._command_channel_socket is not None
+        )
 
     def get_connected_node_id(self) -> Optional[str]:
         """Return the node ID of the currently connected editor, or None."""
         return self._remote_node_id if self.is_connected() else None
 
     def _mark_transport_disconnected(self) -> None:
-        if not self._windows_bridge_connected and self._command_channel_socket is None:
+        if (
+            not self._broker_connected
+            and not self._windows_bridge_connected
+            and self._command_channel_socket is None
+        ):
             self._remote_node_id = None
 
     def _probe_direct_command_socket_liveness(self) -> dict[str, Any]:
@@ -3084,7 +3323,45 @@ class UEConnection:
             'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
         }
 
+    def _probe_broker_liveness(self) -> dict[str, Any]:
+        client = self._broker_client
+        if client is None or not self._broker_connected:
+            self._broker_connected = False
+            self._mark_transport_disconnected()
+            return {
+                'transport': 'broker',
+                'ok': False,
+                'state': 'not_connected',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+        status = self._broker_request(
+            {'op': 'status'}, timeout=max(1.0, CONNECTION_STATUS_TIMEOUT * 4)
+        )
+        if status is None or not status.get('ok'):
+            # Broker connection dead: drop the client so the next connect()
+            # re-elects/respawns. The pinned node is no longer reachable.
+            self._teardown_broker_client()
+            self._mark_transport_disconnected()
+            return {
+                'transport': 'broker',
+                'ok': False,
+                'state': 'broker_unreachable',
+                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+            }
+        self._last_broker_status = status
+        return {
+            'transport': 'broker',
+            'ok': True,
+            'state': 'broker_connected',
+            'node_id': self._remote_node_id,
+            'queue_depth': status.get('queue_depth'),
+            'current_holder': status.get('current_holder'),
+            'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
+        }
+
     def _refresh_connection_liveness(self) -> dict[str, Any]:
+        if self._broker_connected:
+            return self._probe_broker_liveness()
         if self._windows_bridge_connected:
             return self._probe_windows_bridge_liveness()
         if self._command_channel_socket is not None:
@@ -3182,8 +3459,60 @@ class UEConnection:
                 'pid': self._bridge_daemon.pid if self._bridge_daemon is not None else None,
             },
         }
+        status['broker'] = self._broker_status_section()
         status['network'] = _network_diagnostics(self._multicast_group[0])
         return status
+
+    def _broker_status_section(self) -> dict[str, Any]:
+        """E4 observability for the shared editor-command broker.
+
+        ``available`` is True only when this process holds a live broker client.
+        When False, ``reason`` says why (disabled / wsl_uses_bridge /
+        no_broker_reachable_or_spawnable / a transport error) so a fallback to
+        the per-process direct path is never a silent no-op. The dispatch fields
+        (queue_depth / current_holder / result_frame_observed) come from the
+        broker's last status reply.
+        """
+        section: dict[str, Any] = {
+            'enabled': BROKER_ENABLED,
+            'supported': self._broker_supported(),
+            'connected': self._broker_connected,
+            'available': self._broker_connected and self._broker_client is not None,
+            'transport': 'loopback_tcp',
+        }
+        if self._broker_unavailable_reason:
+            section['reason'] = self._broker_unavailable_reason
+        client = self._broker_client
+        if client is not None:
+            try:
+                endpoint = client.endpoint
+                section['endpoint'] = [endpoint[0], endpoint[1]]
+            except Exception:
+                pass
+        last = self._last_broker_status
+        if last is not None:
+            section['pid'] = last.get('pid')
+            section['queue_depth'] = last.get('queue_depth')
+            section['current_holder'] = last.get('current_holder')
+            section['result_frame_observed'] = last.get('result_frame_observed')
+            section['channel_poisoned'] = last.get('channel_poisoned')
+            section['connected_clients'] = last.get('connected_clients')
+        # Advert (broker pid/endpoint as discovered on disk) without forcing a
+        # spawn: a reader-only peek so status reflects a broker even before this
+        # process connects.
+        try:
+            from . import broker as broker_mod
+            advert = broker_mod.read_advert()
+            if advert is not None:
+                section['advert'] = {
+                    'pid': advert.get('pid'),
+                    'host': advert.get('host'),
+                    'port': advert.get('port'),
+                    'heartbeat': advert.get('heartbeat'),
+                }
+        except Exception:
+            pass
+        return section
 
 
 # ------------------------------------------------------------------
