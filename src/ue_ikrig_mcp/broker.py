@@ -343,10 +343,10 @@ class EditorOps:
     The editor-protocol functions (``daemon_execute`` with its verbatim
     no-double-execute discipline, ``discover``, ``editor_process_check``,
     ``close_all_channels``) and their shared ``CHANNELS``/``SOURCE_ID`` live
-    INSIDE the embedded ``_WINDOWS_BRIDGE_SCRIPT`` string in ue_connection (it is
-    the body the detached Windows-bridge subprocess execs), NOT as module-level
-    attributes of ue_connection. The broker runs IN-PROCESS, so it execs that
-    same script body once into a private namespace and calls into it — reusing
+    INSIDE the embedded ``_EDITOR_PROTOCOL_SCRIPT`` string in ue_connection,
+    NOT as module-level attributes of ue_connection. The broker runs IN-PROCESS,
+    so it execs that same script body once into a private namespace and calls
+    into it — reusing
     the exact verbatim logic (and the structured ``timed_out`` flag daemon_execute
     stamps on a may-still-be-running timeout) with zero duplication, while owning
     ONE CHANNELS/SOURCE_ID for the whole broker.
@@ -366,7 +366,7 @@ class EditorOps:
             # Exec the VERBATIM editor-protocol body once. This defines
             # daemon_execute / discover / editor_process_check / close_all_channels
             # and the single shared CHANNELS + SOURCE_ID this broker owns.
-            exec(ue_connection._WINDOWS_BRIDGE_SCRIPT, ns)
+            exec(ue_connection._EDITOR_PROTOCOL_SCRIPT, ns)
             self._ns = ns
         return self._ns
 
@@ -917,7 +917,7 @@ class Broker:
 # ---------------------------------------------------------------------------
 # BrokerClient: the thin-client side used by UEConnection (Phase E3). Holds one
 # persistent loopback connection to the broker, with an id-correlated reader
-# thread (mirrors _WindowsBridgeDaemon's _pending/_responses/reader/write-lock).
+# thread (a _pending/_responses/reader/write-lock request-correlation scheme).
 # ---------------------------------------------------------------------------
 
 class BrokerClient:
@@ -973,8 +973,8 @@ class BrokerClient:
     def request(self, payload: dict[str, Any], timeout: float) -> Optional[dict[str, Any]]:
         """Send one request, block for its id-correlated response. None on death.
 
-        Mirrors _WindowsBridgeDaemon.request: the id here is the broker<->client
-        correlation id, DISTINCT from the editor command (which has none).
+        The id here is the broker<->client correlation id, DISTINCT from the
+        editor command (which has none).
         """
         sock = self._sock
         if sock is None or self._eof:
@@ -1047,7 +1047,7 @@ def spawn_detached_broker(
     HARD REQUIREMENTS (Phase E1, item 4):
       - DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW so the
         broker OUTLIVES its spawner (it is NOT a Popen child that dies with the
-        parent like _WindowsBridgeDaemon).
+        parent).
       - close_fds=True and stdio redirected to NUL/log so it holds NO handle to
         the spawner's stdin/stdout/stderr; otherwise the agent's MCP stdio
         transport wedges (the MCP client never sees EOF).
@@ -1101,9 +1101,16 @@ def _reap(pid: Optional[int]) -> None:
     try:
         if os.name == 'nt':
             import subprocess
+            # The broker may be spawned windowless (pythonw); suppress the
+            # console window taskkill would otherwise flash.
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _si.wShowWindow = 0  # SW_HIDE
             subprocess.run(
                 ['taskkill', '/F', '/PID', str(pid)],
                 capture_output=True, timeout=5,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                startupinfo=_si,
             )
         else:
             import signal

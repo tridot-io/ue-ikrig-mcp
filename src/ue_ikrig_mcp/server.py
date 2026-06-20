@@ -1,7 +1,9 @@
 """MCP entry point for ue-ikrig server."""
 
+import sys
+
 from mcp.server.fastmcp import FastMCP
-from .ue_connection import register_process_cleanup
+from .ue_connection import register_process_cleanup, _is_wsl
 
 server = FastMCP("ue-ikrig")
 
@@ -53,6 +55,19 @@ def register_all_tools():
 
 
 def main():
+    # The WSL->Windows subprocess bridge was removed: the server now discovers
+    # Unreal directly on localhost, which only works when it runs on Windows
+    # Python. Warn (don't exit) to STDERR so the operator sees it without
+    # corrupting the MCP stdio channel on STDOUT.
+    if _is_wsl():
+        print(
+            "[ue-ikrig-mcp] WARNING: running under WSL. The WSL->Windows bridge "
+            "has been removed; UDP discovery of Unreal on the Windows host will "
+            "not work from WSL. Launch the server via Windows Python instead, "
+            "e.g. .venv-win/Scripts/pythonw.exe -m ue_ikrig_mcp",
+            file=sys.stderr,
+            flush=True,
+        )
     register_process_cleanup()
     register_all_tools()
     server.run()

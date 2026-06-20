@@ -2,7 +2,7 @@
 
 WHY THIS FILE EXISTS
 --------------------
-The broker's EditorOps class execs ``ue_connection._WINDOWS_BRIDGE_SCRIPT`` into
+The broker's EditorOps class execs ``ue_connection._EDITOR_PROTOCOL_SCRIPT`` into
 a private namespace to reuse daemon_execute / discover / editor_process_check /
 close_all_channels VERBATIM.  That script body is a raw string embedded in
 ue_connection.py; its ``def`` statements are NOT module-level attributes of
@@ -44,29 +44,29 @@ class BridgeScriptCompletenessTests(unittest.TestCase):
 
     def setUp(self):
         self._ns: dict = {'__name__': 'test_bridge_completeness'}
-        exec(uc._WINDOWS_BRIDGE_SCRIPT, self._ns)
+        exec(uc._EDITOR_PROTOCOL_SCRIPT, self._ns)
 
     def test_daemon_execute_is_defined_and_callable(self):
         self.assertIn('daemon_execute', self._ns,
-                      'daemon_execute missing from _WINDOWS_BRIDGE_SCRIPT namespace')
+                      'daemon_execute missing from _EDITOR_PROTOCOL_SCRIPT namespace')
         self.assertTrue(callable(self._ns['daemon_execute']),
                         'daemon_execute is defined but not callable')
 
     def test_discover_is_defined_and_callable(self):
         self.assertIn('discover', self._ns,
-                      'discover missing from _WINDOWS_BRIDGE_SCRIPT namespace')
+                      'discover missing from _EDITOR_PROTOCOL_SCRIPT namespace')
         self.assertTrue(callable(self._ns['discover']),
                         'discover is defined but not callable')
 
     def test_editor_process_check_is_defined_and_callable(self):
         self.assertIn('editor_process_check', self._ns,
-                      'editor_process_check missing from _WINDOWS_BRIDGE_SCRIPT namespace')
+                      'editor_process_check missing from _EDITOR_PROTOCOL_SCRIPT namespace')
         self.assertTrue(callable(self._ns['editor_process_check']),
                         'editor_process_check is defined but not callable')
 
     def test_close_all_channels_is_defined_and_callable(self):
         self.assertIn('close_all_channels', self._ns,
-                      'close_all_channels missing from _WINDOWS_BRIDGE_SCRIPT namespace')
+                      'close_all_channels missing from _EDITOR_PROTOCOL_SCRIPT namespace')
         self.assertTrue(callable(self._ns['close_all_channels']),
                         'close_all_channels is defined but not callable')
 
@@ -75,7 +75,7 @@ class BridgeScriptCompletenessTests(unittest.TestCase):
         # production EditorOps._namespace() uses; assert all four at once so a
         # single missing name surfaces clearly.
         ns: dict = {'__name__': 'ue_ikrig_mcp_broker_editor_ops'}
-        exec(uc._WINDOWS_BRIDGE_SCRIPT, ns)
+        exec(uc._EDITOR_PROTOCOL_SCRIPT, ns)
         missing = [
             name for name in
             ('daemon_execute', 'discover', 'editor_process_check', 'close_all_channels')
@@ -83,7 +83,7 @@ class BridgeScriptCompletenessTests(unittest.TestCase):
         ]
         self.assertEqual(
             missing, [],
-            'These names are missing or non-callable after exec(_WINDOWS_BRIDGE_SCRIPT): %r'
+            'These names are missing or non-callable after exec(_EDITOR_PROTOCOL_SCRIPT): %r'
             % missing,
         )
 

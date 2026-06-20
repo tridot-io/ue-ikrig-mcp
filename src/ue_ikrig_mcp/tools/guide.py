@@ -196,9 +196,9 @@ _SECTIONS["timeouts"] = """\
 - Scripts run **synchronously on the editor game thread**. The editor UI is
   frozen until the script returns - never call `input()`, never busy-wait or
   `time.sleep()` in a polling loop.
-- Default command timeout is 120s (UE_COMMAND_EXEC_TIMEOUT /
-  UE_WINDOWS_BRIDGE_EXEC_TIMEOUT). For known-heavy work (batch retargets,
-  FBX import/export), pass `timeout_seconds` explicitly on `execute_python`.
+- Default command timeout is 120s (UE_COMMAND_EXEC_TIMEOUT). For known-heavy
+  work (batch retargets, FBX import/export), pass `timeout_seconds` explicitly
+  on `execute_python`.
 - If a call times out, the editor is usually **still running the script** -
   do not immediately resend it (you would queue it twice). Check
   `connection_status`, give the editor time to finish, then verify the effect

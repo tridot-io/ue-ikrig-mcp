@@ -212,18 +212,18 @@ class BrokerIntegrationTests(unittest.TestCase):
 
     def test_broker_supported_false_under_real_wsl(self):
         # Restore the real WSL detection for this one assertion: on this box it is
-        # True, so the broker must be gated OFF and the bridge used instead.
+        # True, so the broker must be gated OFF (it is native-Windows-only).
         uc._is_wsl = self._orig_is_wsl
         conn = uc.UEConnection()
         self.addCleanup(conn.disconnect)
         self.assertFalse(conn._broker_supported())
         # A connect attempt under the WSL gate records the unavailable reason (the
         # reason is populated by the attempt, not by _broker_supported() alone), so
-        # the fallback to the bridge is never a silent no-op.
+        # the fallback to the per-process direct path is never a silent no-op.
         self.assertFalse(conn._try_connect_broker())
-        self.assertEqual(conn._broker_unavailable_reason, 'wsl_uses_bridge')
+        self.assertEqual(conn._broker_unavailable_reason, 'wsl_unsupported')
         section = conn._broker_status_section()
-        self.assertEqual(section['reason'], 'wsl_uses_bridge')
+        self.assertEqual(section['reason'], 'wsl_unsupported')
 
 
 if __name__ == '__main__':

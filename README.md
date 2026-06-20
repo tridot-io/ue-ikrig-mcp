@@ -29,14 +29,13 @@ is mirrored into WSL. The MCP defaults include a WSL multicast-group bind
 fallback, but Unreal still needs a non-loopback bind address and an editor
 restart after changing this setting.
 
-When direct WSL UDP multicast still cannot receive Unreal's `pong`, the MCP
-automatically falls back to a Windows-side Python subprocess bridge
-(`UE_WINDOWS_BRIDGE=true`, default on WSL). The bridge discovers Unreal and
-opens the command callback from Windows localhost, which avoids WSL/Windows
-multicast namespace loss while keeping the MCP server in WSL. Set
-`UE_WINDOWS_PYTHON` to a Windows Python executable such as
-`.venv-win/Scripts/python.exe` when you need the bridge to use the same
-Windows-path Python that worked in manual probes.
+When developing in WSL, launch the MCP server via Windows Python (pythonw.exe)
+so it discovers Unreal on Windows localhost directly — there is no WSL→Windows
+bridge anymore. For example:
+`.venv-win/Scripts/pythonw.exe -m ue_ikrig_mcp`. Running the server inside WSL
+will not discover an editor on the Windows host (the WSL/Windows network
+namespace blocks the discovery UDP), and the server prints a warning to that
+effect on startup.
 
 Unreal may need a restart after plugin or network setting changes. Windows
 Defender Firewall must allow `UnrealEditor.exe`, UDP multicast on `6766`, and
@@ -135,17 +134,17 @@ The server communicates with UE Editor via the built-in Python Remote Execution 
 
 Multiple independent MCP server processes may connect to the same Unreal Editor.
 That concurrency boundary is **per MCP process**: each process keeps its own
-discovery state, local command listener, and optional Windows bridge daemon. It
-does **not** mean one MCP process can hold multiple active editor connections at
-once. When a second MCP process targets the same editor and the default local
-command port is already in use, it should fall back to an ephemeral local port
-and report that in `connection_status`.
+discovery state and local command listener. It does **not** mean one MCP process
+can hold multiple active editor connections at once. When a second MCP process
+targets the same editor and the default local command port is already in use, it
+should fall back to an ephemeral local port and report that in
+`connection_status`.
 
 ### Discover many, connect one
 
 `discover_editors` is a discovery tool: it can return every visible Unreal
-Editor node for the current direct UDP or Windows-bridge transport. Use the
-returned `node_id` values to choose the target editor explicitly.
+Editor node discovered over direct UDP. Use the returned `node_id` values to
+choose the target editor explicitly.
 
 `connect_to_editor` is a selection tool: one MCP server process keeps exactly
 one active editor connection at a time. When more than one editor is discovered
@@ -163,7 +162,7 @@ stable ambiguity signal:
     {
       "node_id": "...",
       "project_name": "...",
-      "_transport": "direct_udp|windows_subprocess"
+      "_transport": "direct_udp"
     }
   ],
   "next_action": "Call connect_to_editor(node_id=<one of nodes[].node_id>)."
@@ -184,25 +183,21 @@ such as `connected`, `node_id`, `discovered_nodes`, `selection_required`, and
 ## Discovery preflight / doctor
 
 Run `preflight_discovery` before `discover_editors`/`connect_to_editor` when
-bringing up a new machine, WSL environment, or editor. It sends Unreal's exact
-Remote Execution UDP `ping` packet and waits for a `pong`. Only after a direct
-pong does it optionally test the TCP `open_connection` callback; it never
-executes Python in Unreal. On WSL, if direct Linux UDP gets no pong but the
-Windows bridge can see the editor, preflight reports
-`PONG_RECEIVED_VIA_WINDOWS_BRIDGE` and normal MCP calls proceed through the
-`windows_subprocess` transport.
+bringing up a new machine or editor. It sends Unreal's exact Remote Execution
+UDP `ping` packet and waits for a `pong`. Only after a pong does it optionally
+test the TCP `open_connection` callback; it never executes Python in Unreal.
 
-If `preflight_discovery` reports `NO_PONG_RECEIVED_UNPROVEN`, neither WSL UDP
-nor the Windows bridge proved discovery. Do **not** keep retrying
-`connect_to_editor` or `execute_python`; fix discovery first:
+If `preflight_discovery` reports `NO_PONG_RECEIVED_UNPROVEN`, discovery was not
+proven. Do **not** keep retrying `connect_to_editor` or `execute_python`; fix
+discovery first:
 
 - enable Python Remote Execution in Unreal,
 - match `RemoteExecutionMulticastGroupEndpoint` with `UE_MULTICAST_GROUP` /
   `UE_MULTICAST_PORT`,
 - set the correct Unreal multicast bind address,
 - check Windows Firewall and network profile,
-- for WSL, try TTL `1`, explicit interface overrides, mirrored networking, or
-  leave the Windows bridge enabled if multicast cannot cross the WSL namespace.
+- if running under WSL, launch the server via Windows Python (pythonw.exe) so
+  discovery runs on the Windows host instead of across the WSL namespace.
 
 Useful environment overrides:
 
@@ -218,38 +213,19 @@ UE_COMMAND_PORT=6777
 UE_COMMAND_EXEC_TIMEOUT=120            # seconds for direct TCP command execution
 UE_CONNECTION_STATUS_TIMEOUT=0.25      # seconds for connection_status liveness probes
 UE_CALLBACK_HOST=172.30.1.10           # never advertise 0.0.0.0 to Unreal
-UE_WINDOWS_BRIDGE=true                 # WSL default; set false to disable
-UE_WINDOWS_PYTHON=/mnt/c/.../python.exe # explicit Windows Python for bridge
-UE_WINDOWS_BRIDGE_DISCOVERY_TIMEOUT=5  # seconds for Windows-side discovery
-UE_WINDOWS_BRIDGE_EXEC_TIMEOUT=120     # seconds for bridge command execution
-UE_WINDOWS_BRIDGE_DAEMON=true          # persistent Windows bridge daemon; false = one-shot per call
-UE_WINDOWS_BRIDGE_DAEMON_START_TIMEOUT=15  # seconds to wait for daemon readiness ping
-UE_WINDOWS_BRIDGE_DAEMON_COOLDOWN=60   # seconds before retrying a launcher whose daemon failed
-UE_BRIDGE_NODE_CACHE_TTL=5             # seconds to cache bridge discovery results
-UE_BRIDGE_EMPTY_CACHE_TTL=2            # seconds to cache an empty discovery result
 UE_DISCOVERY_SETTLE=0.25               # extra wait after first pong for more editors
+UE_BROKER=true                         # shared editor-command broker (native, non-WSL); false to disable
 UE_SCRIPT_PREFLIGHT=true               # local syntax check before sending scripts to UE
 UE_MCP_SCRIPT_DIR=~/.ue_ikrig_mcp/scripts      # saved script store location
 UE_MCP_CATALOG_DIR=~/.ue_ikrig_mcp/api_catalog # unreal API catalogue location
 ```
-
-### Windows bridge daemon (performance)
-
-On WSL the bridge keeps one persistent Windows Python process alive
-(`UE_WINDOWS_BRIDGE_DAEMON=true`, the default) instead of spawning a process
-per call. The daemon also holds the TCP command channel to the editor open
-across `execute_python` calls, discovery early-exits on the first pong, and
-discovery results are cached for `UE_BRIDGE_NODE_CACHE_TTL` seconds. Measured
-against a live editor this takes repeat discovery from ~4.7s to ~0.05s,
-`connect_to_editor` from ~4.8s to ~0.05s, and repeat `execute_python` from
-~0.6s to ~0.3s. Set `UE_WINDOWS_BRIDGE_DAEMON=false` to restore the previous
-one-shot behavior.
 
 ### Script guidance for MCP drivers
 
 - `ue_python_guide` returns the scripting guide (result protocol, asset-path
   rules, modern vs deprecated APIs, timeout discipline, failure triage); read
   it once per session before generating non-trivial scripts.
+- For graph authoring across Blueprint, WidgetBlueprint, AnimBlueprint, Control Rig, and Material, see `docs/ue_graph_authoring_driver_guideline.md` before assuming node creation or pin-wiring support.
 - `execute_python` auto-connects when no editor connection exists, validates
   script syntax locally before any editor round-trip
   (`UE_SCRIPT_PREFLIGHT=false` to disable), and failed results include a
@@ -288,22 +264,19 @@ listener details, and socket errors. If you need help, collect:
   Wireshark/`pktmon`.
 
 `connection_status` actively probes the current transport before reporting
-`connected`: direct TCP sockets are peeked for peer closure, and connected
-Windows-bridge nodes are rediscovered. The `connection_liveness` field records
-the probe result, and stale transports are cleared instead of being reported as
-connected. It also reports the loaded package version/source file under
-`package` and the selected bridge launcher under `windows_bridge.launcher`.
+`connected`: direct TCP sockets are peeked for peer closure, and a broker
+connection is status-pinged. The `connection_liveness` field records the probe
+result, and stale transports are cleared instead of being reported as connected.
+It also reports the loaded package version/source file under `package`.
 For multi-editor sessions, check the active `node_id` separately from
 `discovered_nodes`: `selection_required=true` means discovery found more than
 one editor and the next connect must name a `node_id`; `selection_required=false`
 with `connected=true` means this MCP process has one active editor selected.
-Check these fields when `uvx` appears to be running stale code, when the bridge
-is not using the expected Windows Python, or when a previously connected editor
-has disappeared.
+Check these fields when `uvx` appears to be running stale code or when a
+previously connected editor has disappeared.
 
 `execute_python` accepts `timeout_seconds` for per-call command bounds. When it
-is omitted, direct TCP uses `UE_COMMAND_EXEC_TIMEOUT` and the Windows bridge uses
-`UE_WINDOWS_BRIDGE_EXEC_TIMEOUT`.
+is omitted, command execution uses `UE_COMMAND_EXEC_TIMEOUT` (default 120s).
 
 ## License
 

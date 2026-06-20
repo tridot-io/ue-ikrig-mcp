@@ -1,8 +1,6 @@
 import asyncio
 import json
-import os
 import socket
-import types
 import unittest
 
 from ue_ikrig_mcp import ue_connection as uc
@@ -256,35 +254,6 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertEqual(status["connection_liveness"]["transport"], "direct_tcp")
         self.assertFalse(status["connection_liveness"]["ok"])
 
-    def test_connection_status_clears_windows_bridge_when_node_disappears(self):
-        class LostBridgeConnection(uc.UEConnection):
-            def _windows_bridge_supported(self):
-                return True
-
-            def _discover_windows_bridge_nodes(self, timeout=2.0):
-                self.discovery_timeout = timeout
-                self._last_windows_bridge_result = {
-                    "ok": False,
-                    "error": "No Unreal Editor instances discovered from Windows bridge.",
-                }
-                self._windows_bridge_node_ids = set()
-                self._windows_bridge_nodes = []
-                return []
-
-        conn = LostBridgeConnection()
-        conn._remote_node_id = "stale-node"
-        conn._windows_bridge_connected = True
-        conn._windows_bridge_node_ids = {"stale-node"}
-        conn._windows_bridge_nodes = [{"node_id": "stale-node"}]
-
-        status = conn.get_status()
-
-        self.assertFalse(status["connected"])
-        self.assertIsNone(status["node_id"])
-        self.assertFalse(status["windows_bridge"]["connected"])
-        self.assertEqual(status["connection_liveness"]["transport"], "windows_subprocess")
-        self.assertFalse(status["connection_liveness"]["ok"])
-
     def test_status_flags_wildcard_callback_host_without_advertising_it(self):
         conn = uc.UEConnection(
             command_endpoint=("127.0.0.1", 6777),
@@ -320,135 +289,11 @@ class ConnectionLifecycleTests(unittest.TestCase):
             def _open_command_channel_with_fallback(self, *args, **kwargs):
                 raise AssertionError("callback should not be attempted without a pong")
 
-            def _windows_bridge_supported(self):
-                return False
-
         result = NoPongConnection().preflight_discovery(timeout=0.1, test_callback=True)
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["classification"], "NO_PONG_RECEIVED_UNPROVEN")
         self.assertIn("UE_REMOTE_EXECUTION_DISABLED", result["possible_classifications"])
-
-    def test_preflight_no_pong_retries_with_windows_bridge_when_supported(self):
-        class BridgeAfterNoPongConnection(uc.UEConnection):
-            def __init__(self):
-                super().__init__()
-                self.bridge_calls = []
-
-            def start_discovery(self):
-                self._running = True
-
-            def _broadcast_ping(self, now):
-                self._last_ping = now
-                self._last_ping_sent_at = now
-
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                self.bridge_calls.append((payload, timeout))
-                return {
-                    "ok": True,
-                    "nodes": [{
-                        "node_id": "launched-node",
-                        "project_name": "ProjectAvadot",
-                    }],
-                }
-
-            def _open_command_channel_with_fallback(self, *args, **kwargs):
-                raise AssertionError("direct WSL callback should not be used for bridge retry")
-
-        conn = BridgeAfterNoPongConnection()
-
-        result = conn.preflight_discovery(timeout=0.1, test_callback=False)
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["classification"], "PONG_RECEIVED_VIA_WINDOWS_BRIDGE")
-        self.assertEqual(conn.bridge_calls[0][0]["op"], "discover")
-        self.assertEqual(conn.bridge_calls[0][0]["group"], ["239.0.0.1", 6766])
-        self.assertGreaterEqual(conn.bridge_calls[0][0]["ttl"], 1)
-        self.assertEqual(result["nodes"][0]["node_id"], "launched-node")
-        self.assertEqual(result["nodes"][0]["_transport"], "windows_subprocess")
-
-    def test_preflight_bridge_discovery_marks_callback_not_run(self):
-        class BridgeAfterNoPongConnection(uc.UEConnection):
-            def start_discovery(self):
-                self._running = True
-
-            def _broadcast_ping(self, now):
-                self._last_ping = now
-                self._last_ping_sent_at = now
-
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                return {
-                    "ok": True,
-                    "nodes": [{
-                        "node_id": "launched-node",
-                        "project_name": "ProjectAvadot",
-                    }],
-                }
-
-        result = BridgeAfterNoPongConnection().preflight_discovery(
-            timeout=0.1,
-            test_callback=True,
-        )
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["classification"], "PONG_RECEIVED_VIA_WINDOWS_BRIDGE")
-        self.assertEqual(result["callback_classification"], "NOT_RUN_WINDOWS_BRIDGE_DISCOVERY_ONLY")
-
-    def test_get_remote_nodes_uses_windows_bridge_when_wsl_multicast_has_no_nodes(self):
-        class BridgeConnection(uc.UEConnection):
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                self.bridge_payload = payload
-                return {
-                    "ok": True,
-                    "nodes": [{
-                        "node_id": "win-node",
-                        "project_name": "ProjectAvadot",
-                    }],
-                }
-
-        conn = BridgeConnection()
-        conn._running = True
-
-        nodes = conn.get_remote_nodes()
-
-        self.assertEqual(nodes[0]["node_id"], "win-node")
-        self.assertEqual(nodes[0]["_transport"], "windows_subprocess")
-        self.assertIn("win-node", conn._windows_bridge_node_ids)
-        self.assertEqual(conn.bridge_payload["op"], "discover")
-
-    def test_get_remote_nodes_preserves_multiple_windows_bridge_nodes(self):
-        class BridgeConnection(uc.UEConnection):
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                self.bridge_payload = payload
-                return {
-                    "ok": True,
-                    "nodes": [
-                        {"node_id": "node-a", "project_name": "ProjectA"},
-                        {"node_id": "node-b", "project_name": "ProjectB"},
-                    ],
-                }
-
-        conn = BridgeConnection()
-        conn._running = True
-
-        nodes = conn.get_remote_nodes()
-
-        self.assertEqual([node["node_id"] for node in nodes], ["node-a", "node-b"])
-        self.assertEqual([node["_transport"] for node in nodes], ["windows_subprocess", "windows_subprocess"])
-        self.assertEqual(conn._windows_bridge_node_ids, {"node-a", "node-b"})
-        self.assertEqual(conn.bridge_payload["op"], "discover")
 
     def test_direct_connect_without_node_id_raises_multiple_editors_payload(self):
         self.assertTrue(
@@ -461,7 +306,7 @@ class ConnectionLifecycleTests(unittest.TestCase):
                 super().__init__()
                 self._running = True
 
-            def _windows_bridge_supported(self):
+            def _broker_supported(self):
                 return False
 
             def get_remote_nodes(self):
@@ -478,37 +323,6 @@ class ConnectionLifecycleTests(unittest.TestCase):
 
         self._assert_multiple_editors_payload(raised.exception.to_payload())
 
-    def test_windows_bridge_connect_without_node_id_raises_multiple_editors_payload(self):
-        self.assertTrue(
-            hasattr(uc, "UEMultipleEditorsAmbiguousError"),
-            "UEConnection.connect must expose a dedicated multi-editor ambiguity exception",
-        )
-
-        class BridgeConnection(uc.UEConnection):
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                if payload["op"] == "discover":
-                    return {
-                        "ok": True,
-                        "nodes": [
-                            {"node_id": "node-a", "project_name": "ProjectA"},
-                            {"node_id": "node-b", "project_name": "ProjectB"},
-                        ],
-                    }
-                raise AssertionError(payload)
-
-            def _open_command_channel_with_fallback(self, *args, **kwargs):
-                raise AssertionError("ambiguous bridge connect must not fall back to direct TCP")
-
-        with self.assertRaises(uc.UEMultipleEditorsAmbiguousError) as raised:
-            BridgeConnection().connect()
-
-        payload = raised.exception.to_payload()
-        self._assert_multiple_editors_payload(payload)
-        self.assertEqual([node["_transport"] for node in payload["nodes"]], ["windows_subprocess", "windows_subprocess"])
-
     def test_explicit_node_id_selects_one_direct_node_from_many(self):
         class MultiNodeConnection(uc.UEConnection):
             def __init__(self):
@@ -516,7 +330,7 @@ class ConnectionLifecycleTests(unittest.TestCase):
                 self._running = True
                 self.opened_node_ids = []
 
-            def _windows_bridge_supported(self):
+            def _broker_supported(self):
                 return False
 
             def get_remote_nodes(self):
@@ -580,9 +394,6 @@ class ConnectionLifecycleTests(unittest.TestCase):
                 self._nodes.update("node-a", {"project_name": "ProjectA"})
                 self._nodes.update("node-b", {"project_name": "ProjectB"})
 
-            def _windows_bridge_supported(self):
-                return False
-
             def _refresh_connection_liveness(self):
                 self._mark_transport_disconnected()
                 return {
@@ -629,65 +440,19 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertIs(status["selection_required"], False)
         self.assertEqual([node["node_id"] for node in status["discovered_nodes"]], ["node-a", "node-b"])
 
-    def test_connect_and_execute_can_use_windows_bridge_transport(self):
-        class BridgeConnection(uc.UEConnection):
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                if payload["op"] == "discover":
-                    return {
-                        "ok": True,
-                        "nodes": [{
-                            "node_id": "win-node",
-                            "project_name": "ProjectAvadot",
-                        }],
-                    }
-                if payload["op"] == "execute":
-                    self.execute_payload = payload
-                    return {
-                        "ok": True,
-                        "result": {
-                            "success": True,
-                            "result": "None",
-                            "output": "__MCP_RESULT__{\"ok\": true}",
-                        },
-                    }
-                raise AssertionError(payload)
-
-            def _open_command_channel_with_fallback(self, *args, **kwargs):
-                raise AssertionError("direct WSL callback should not be used for bridge nodes")
-
-            def start_discovery(self):
-                raise AssertionError("bridge connect should not start direct WSL discovery first")
-
-        conn = BridgeConnection()
-
-        conn.connect()
-        result = conn.execute("print('hi')", mode="ExecuteStatement")
-
-        self.assertTrue(conn.is_connected())
-        self.assertTrue(result["success"])
-        self.assertEqual(result["parsed"], {"ok": True})
-        self.assertEqual(conn.execute_payload["node_id"], "win-node")
-        self.assertEqual(conn.execute_payload["mode"], "ExecuteStatement")
-
     def test_connect_omitted_node_id_raises_ambiguity_for_direct_multi_node_discovery(self):
         class DirectMultiNodeConnection(uc.UEConnection):
             def __init__(self):
                 super().__init__()
                 self.opened = []
 
-            def _windows_bridge_supported(self):
+            def _broker_supported(self):
                 return False
 
             def start_discovery(self):
                 self._running = True
                 self._nodes.update("node-a", {"project_name": "A"})
                 self._nodes.update("node-b", {"project_name": "B"})
-
-            def _windows_bridge_supported(self):
-                return False
 
             def _open_command_channel_with_fallback(self, node_id, *args, **kwargs):
                 self.opened.append(node_id)
@@ -711,75 +476,6 @@ class ConnectionLifecycleTests(unittest.TestCase):
 
         conn.connect(node_id="node-b", timeout=0.05)
         self.assertEqual(conn.opened, ["node-b"])
-
-    def test_connect_omitted_node_id_raises_ambiguity_for_bridge_multi_node_discovery(self):
-        class BridgeMultiNodeConnection(uc.UEConnection):
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                if payload["op"] == "discover":
-                    return {
-                        "ok": True,
-                        "nodes": [
-                            {"node_id": "win-a", "project_name": "A"},
-                            {"node_id": "win-b", "project_name": "B"},
-                        ],
-                    }
-                raise AssertionError(payload)
-
-            def start_discovery(self):
-                raise AssertionError("bridge ambiguity should be resolved before direct discovery")
-
-            def _open_command_channel_with_fallback(self, *args, **kwargs):
-                raise AssertionError("bridge nodes should not use direct callback")
-
-        conn = BridgeMultiNodeConnection()
-
-        with self.assertRaises(uc.UEMultipleEditorsAmbiguousError) as ctx:
-            conn.connect()
-
-        payload = ctx.exception.to_payload()
-        self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
-        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["win-a", "win-b"])
-        self.assertEqual(payload["nodes"][0]["_transport"], "windows_subprocess")
-
-        conn.connect(node_id="win-b")
-        self.assertTrue(conn.is_connected())
-        self.assertEqual(conn.get_connected_node_id(), "win-b")
-
-    def test_connect_omitted_node_id_reuses_valid_active_editor_before_ambiguity(self):
-        class ConnectedBridgeConnection(uc.UEConnection):
-            def _refresh_connection_liveness(self):
-                return {
-                    "transport": "windows_subprocess",
-                    "ok": True,
-                    "state": "test_connected",
-                    "node_id": self._remote_node_id,
-                }
-
-            def get_remote_nodes(self):
-                raise AssertionError("valid active editor must be reused before discovery")
-
-        conn = ConnectedBridgeConnection()
-        conn._windows_bridge_connected = True
-        conn._remote_node_id = "win-a"
-        conn._windows_bridge_nodes = [
-            {"node_id": "win-a", "project_name": "A", "_transport": "windows_subprocess"},
-            {"node_id": "win-b", "project_name": "B", "_transport": "windows_subprocess"},
-        ]
-        conn._windows_bridge_node_ids = {"win-a", "win-b"}
-
-        conn.connect()
-        status = conn.get_status()
-
-        self.assertEqual(conn.get_connected_node_id(), "win-a")
-        self.assertTrue(status["connected"])
-        self.assertEqual(status["node_id"], "win-a")
-        self.assertEqual(status["active_node_id"], "win-a")
-        self.assertFalse(status["selection_required"])
-        self.assertTrue(status["one_active_editor_per_process"])
-        self.assertEqual([node["node_id"] for node in status["discovered_nodes"]], ["win-a", "win-b"])
 
     def test_two_direct_connections_to_same_node_keep_distinct_local_ports_and_disconnect_isolated(self):
         class LoopbackConnection(uc.UEConnection):
@@ -851,67 +547,6 @@ class ConnectionLifecycleTests(unittest.TestCase):
             second.disconnect()
             first.close_peers()
             second.close_peers()
-
-    def test_two_bridge_connections_to_same_node_keep_local_state_isolated(self):
-        class BridgeConnection(uc.UEConnection):
-            def __init__(self):
-                super().__init__()
-                self.execute_payloads = []
-
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                if payload["op"] == "discover":
-                    return {
-                        "ok": True,
-                        "nodes": [{
-                            "node_id": "shared-node",
-                            "project_name": "ProjectAvadot",
-                        }],
-                    }
-                if payload["op"] == "execute":
-                    self.execute_payloads.append(dict(payload))
-                    return {
-                        "ok": True,
-                        "result": {
-                            "success": True,
-                            "result": "None",
-                            "output": "__MCP_RESULT__{\"ok\": true}",
-                        },
-                    }
-                raise AssertionError(payload)
-
-        first = BridgeConnection()
-        second = BridgeConnection()
-        try:
-            first.connect()
-            second.connect()
-
-            self.assertTrue(first.is_connected())
-            self.assertTrue(second.is_connected())
-            self.assertEqual(first.get_connected_node_id(), "shared-node")
-            self.assertEqual(second.get_connected_node_id(), "shared-node")
-
-            self.assertTrue(first.execute("print('first')")["success"])
-            self.assertTrue(second.execute("print('second')")["success"])
-
-            first.disconnect()
-
-            second_status = second.get_status()
-            self.assertTrue(second_status["connected"])
-            self.assertTrue(second_status["windows_bridge"]["connected"])
-            self.assertEqual(second_status["node_id"], "shared-node")
-
-            after_disconnect = second.execute("print('after disconnect')")
-            self.assertTrue(after_disconnect["success"])
-            self.assertEqual(
-                [payload["node_id"] for payload in second.execute_payloads],
-                ["shared-node", "shared-node"],
-            )
-        finally:
-            first.disconnect()
-            second.disconnect()
 
     def test_direct_execute_uses_bounded_socket_timeout_for_stalled_editor(self):
         class SilentCommandSocket:
@@ -1009,189 +644,6 @@ class ConnectionLifecycleTests(unittest.TestCase):
         self.assertTrue(payload["error"])
         self.assertIn("timed out", payload["message"])
 
-    def test_windows_python_launcher_honors_explicit_windows_path(self):
-        original_env = os.environ.get("UE_WINDOWS_PYTHON")
-        original_exists = uc.os.path.exists
-        original_which = uc.shutil.which
-        try:
-            os.environ["UE_WINDOWS_PYTHON"] = r"C:\Users\me\AppData\Local\Python\bin\python.exe"
-            uc.os.path.exists = lambda path: path == "/mnt/c/Users/me/AppData/Local/Python/bin/python.exe"
-            uc.shutil.which = lambda name: None
-
-            command, diagnostics = uc._find_windows_python_launcher()
-        finally:
-            if original_env is None:
-                os.environ.pop("UE_WINDOWS_PYTHON", None)
-            else:
-                os.environ["UE_WINDOWS_PYTHON"] = original_env
-            uc.os.path.exists = original_exists
-            uc.shutil.which = original_which
-
-        self.assertEqual(command, ["/mnt/c/Users/me/AppData/Local/Python/bin/python.exe"])
-        self.assertEqual(diagnostics["source"], "UE_WINDOWS_PYTHON")
-
-    def test_run_windows_bridge_prefers_direct_windows_python_launcher(self):
-        original_candidates = uc._windows_bridge_launcher_candidates
-        original_powershell = uc._find_powershell_executable
-        original_run = uc.subprocess.run
-        original_wsl_path = uc._wsl_path_to_windows
-        captured = {}
-        try:
-            uc._windows_bridge_launcher_candidates = lambda: ([
-                (
-                    ["/mnt/c/Users/me/AppData/Local/Python/bin/python.exe"],
-                    {"type": "direct_python", "source": "test"},
-                ),
-            ],
-                {"type": "available"},
-            )
-            uc._find_powershell_executable = lambda: (_ for _ in ()).throw(
-                AssertionError("PowerShell should not be consulted when direct Windows Python is available")
-            )
-            uc._wsl_path_to_windows = lambda path: "C:\\bridge\\" + os.path.basename(path)
-
-            def fake_run(args, **kwargs):
-                captured["args"] = list(args)
-                return types.SimpleNamespace(
-                    returncode=0,
-                    stdout=uc._WINDOWS_BRIDGE_RESULT_PREFIX + json.dumps({"ok": True, "nodes": []}) + "\n",
-                    stderr="",
-                )
-
-            uc.subprocess.run = fake_run
-
-            result = uc.UEConnection()._run_windows_bridge(
-                {"op": "discover", "group": ["239.0.0.1", 6766], "ttl": 1, "timeout": 0.1},
-                timeout=1,
-            )
-        finally:
-            uc._windows_bridge_launcher_candidates = original_candidates
-            uc._find_powershell_executable = original_powershell
-            uc.subprocess.run = original_run
-            uc._wsl_path_to_windows = original_wsl_path
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(captured["args"][0], "/mnt/c/Users/me/AppData/Local/Python/bin/python.exe")
-        self.assertTrue(captured["args"][1].startswith("C:\\bridge\\"))
-        self.assertTrue(captured["args"][2].startswith("C:\\bridge\\"))
-        self.assertEqual(result["_bridge_launcher"]["type"], "direct_python")
-
-    def test_run_windows_bridge_retries_next_auto_launcher_after_launcher_failure(self):
-        original_candidates = uc._windows_bridge_launcher_candidates
-        original_run = uc.subprocess.run
-        original_wsl_path = uc._wsl_path_to_windows
-        calls = []
-        try:
-            uc._windows_bridge_launcher_candidates = lambda: ([
-                (
-                    ["/mnt/c/bad/python.exe"],
-                    {"type": "direct_python", "source": "repo .venv-win", "explicit": False},
-                ),
-                (
-                    ["/mnt/c/good/python.exe"],
-                    {"type": "direct_python", "source": "Windows user Python", "explicit": False},
-                ),
-            ],
-                {"type": "available"},
-            )
-            uc._wsl_path_to_windows = lambda path: "C:\\bridge\\" + os.path.basename(path)
-
-            def fake_run(args, **kwargs):
-                calls.append(list(args))
-                if args[0] == "/mnt/c/bad/python.exe":
-                    return types.SimpleNamespace(returncode=1, stdout="", stderr="bad launcher")
-                return types.SimpleNamespace(
-                    returncode=0,
-                    stdout=uc._WINDOWS_BRIDGE_RESULT_PREFIX + json.dumps({"ok": True, "nodes": []}) + "\n",
-                    stderr="",
-                )
-
-            uc.subprocess.run = fake_run
-
-            result = uc.UEConnection()._run_windows_bridge(
-                {"op": "discover", "group": ["239.0.0.1", 6766], "ttl": 1, "timeout": 0.1},
-                timeout=1,
-            )
-        finally:
-            uc._windows_bridge_launcher_candidates = original_candidates
-            uc.subprocess.run = original_run
-            uc._wsl_path_to_windows = original_wsl_path
-
-        self.assertTrue(result["ok"])
-        self.assertEqual([call[0] for call in calls], ["/mnt/c/bad/python.exe", "/mnt/c/good/python.exe"])
-        self.assertEqual(result["_bridge_launcher"]["source"], "Windows user Python")
-        self.assertEqual(result["_bridge_launcher_failures"][0]["source"], "repo .venv-win")
-
-    def test_py_exe_direct_launcher_uses_python3_switch(self):
-        original_candidates = uc._candidate_windows_python_paths
-        original_exists = uc.os.path.exists
-        original_powershell = uc._find_powershell_executable
-        try:
-            uc._candidate_windows_python_paths = lambda: [("PATH py.exe", "/mnt/c/Windows/py.exe")]
-            uc.os.path.exists = lambda path: path == "/mnt/c/Windows/py.exe"
-            uc._find_powershell_executable = lambda: None
-
-            candidates, _diagnostics = uc._windows_bridge_launcher_candidates()
-        finally:
-            uc._candidate_windows_python_paths = original_candidates
-            uc.os.path.exists = original_exists
-            uc._find_powershell_executable = original_powershell
-
-        self.assertEqual(candidates[0][0], ["/mnt/c/Windows/py.exe", "-3"])
-
-    def test_missing_explicit_windows_python_does_not_fall_back_to_auto_candidates(self):
-        original_candidates = uc._candidate_windows_python_paths
-        original_exists = uc.os.path.exists
-        original_powershell = uc._find_powershell_executable
-        try:
-            uc._candidate_windows_python_paths = lambda: [
-                ("UE_WINDOWS_PYTHON", "/mnt/c/missing/python.exe"),
-                ("repo .venv-win", "/mnt/c/auto/python.exe"),
-            ]
-            uc.os.path.exists = lambda path: path == "/mnt/c/auto/python.exe"
-            uc._find_powershell_executable = lambda: "/mnt/c/Windows/System32/powershell.exe"
-
-            candidates, diagnostics = uc._windows_bridge_launcher_candidates()
-        finally:
-            uc._candidate_windows_python_paths = original_candidates
-            uc.os.path.exists = original_exists
-            uc._find_powershell_executable = original_powershell
-
-        self.assertEqual(candidates, [])
-        self.assertTrue(diagnostics["python"]["explicit_configured"])
-        self.assertEqual(diagnostics["powershell_skipped"], "explicit Windows Python configured")
-
-    def test_windows_bridge_supported_short_circuits_before_launcher_probe(self):
-        original_enabled = uc.WINDOWS_BRIDGE_ENABLED
-        original_is_wsl = uc._is_wsl
-        original_launcher = uc._windows_bridge_launcher_candidates
-        try:
-            uc.WINDOWS_BRIDGE_ENABLED = False
-            uc._is_wsl = lambda: (_ for _ in ()).throw(
-                AssertionError("_is_wsl should not be probed when bridge is disabled")
-            )
-            uc._windows_bridge_launcher_candidates = lambda: (_ for _ in ()).throw(
-                AssertionError("launcher should not be probed when bridge is disabled")
-            )
-
-            self.assertFalse(uc.UEConnection()._windows_bridge_supported())
-
-            uc.WINDOWS_BRIDGE_ENABLED = True
-            uc._is_wsl = lambda: False
-            self.assertFalse(uc.UEConnection()._windows_bridge_supported())
-        finally:
-            uc.WINDOWS_BRIDGE_ENABLED = original_enabled
-            uc._is_wsl = original_is_wsl
-            uc._windows_bridge_launcher_candidates = original_launcher
-
-    def test_status_exposes_package_and_windows_bridge_launcher_diagnostics(self):
-        status = uc.UEConnection().get_status()
-
-        self.assertEqual(status["package"]["name"], "ue-ikrig-mcp")
-        self.assertIn("version", status["package"])
-        self.assertTrue(status["package"]["source_file"].endswith("ue_connection.py"))
-        self.assertIn("launcher", status["windows_bridge"])
-
     def test_preflight_stale_node_does_not_satisfy_fresh_pong_gate(self):
         class StaleNodeConnection(uc.UEConnection):
             def _broadcast_ping(self, now):
@@ -1200,9 +652,6 @@ class ConnectionLifecycleTests(unittest.TestCase):
 
             def _open_command_channel_with_fallback(self, *args, **kwargs):
                 raise AssertionError("callback should not be attempted for stale nodes")
-
-            def _windows_bridge_supported(self):
-                return False
 
         conn = StaleNodeConnection()
         conn._running = True

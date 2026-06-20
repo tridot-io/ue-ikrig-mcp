@@ -1,13 +1,9 @@
 import asyncio
-import io
 import json
 import os
 import socket
-import sys
 import tempfile
 import threading
-import time
-import types
 import unittest
 
 from ue_ikrig_mcp import api_index
@@ -33,339 +29,36 @@ class _FakeServer:
         return decorator
 
 
-def _exec_bridge_script():
-    """Execute the embedded bridge script into a fresh namespace."""
-    namespace = {"__name__": "bridge_under_test"}
-    exec(uc._WINDOWS_BRIDGE_SCRIPT, namespace)
+def _exec_editor_protocol_script():
+    """Execute the embedded editor-protocol script into a fresh namespace."""
+    namespace = {"__name__": "editor_protocol_under_test"}
+    exec(uc._EDITOR_PROTOCOL_SCRIPT, namespace)
     return namespace
-
-
-def _local_python_launchers():
-    """Launcher candidates that run the bridge daemon on the local Python."""
-    return (
-        [([sys.executable], {"type": "direct_python", "source": "test-local"})],
-        {"type": "available"},
-    )
-
-
-class WindowsBridgeDaemonTests(unittest.TestCase):
-    def setUp(self):
-        self._original_candidates = uc._windows_bridge_launcher_candidates
-        self._original_wsl_path = uc._wsl_path_to_windows
-        uc._windows_bridge_launcher_candidates = _local_python_launchers
-        # Local python reads the script straight from the WSL/Linux path.
-        uc._wsl_path_to_windows = lambda path: path
-        self.conn = uc.UEConnection()
-
-    def tearDown(self):
-        self.conn.disconnect()
-        uc._windows_bridge_launcher_candidates = self._original_candidates
-        uc._wsl_path_to_windows = self._original_wsl_path
-
-    def test_daemon_ping_roundtrip_and_process_reuse(self):
-        first = self.conn._run_windows_bridge({"op": "ping"}, timeout=15)
-
-        self.assertTrue(first["ok"])
-        self.assertEqual(first["op"], "ping")
-        self.assertEqual(first["channels"], [])
-        self.assertTrue(first["_bridge_process"]["daemon"])
-        self.assertEqual(first["_bridge_launcher"]["transport"], "persistent_daemon")
-
-        second = self.conn._run_windows_bridge({"op": "ping"}, timeout=15)
-
-        self.assertTrue(second["ok"])
-        self.assertEqual(
-            first["_bridge_process"]["pid"],
-            second["_bridge_process"]["pid"],
-            "daemon process should be reused across bridge calls",
-        )
-
-    def test_daemon_restarts_after_process_death(self):
-        first = self.conn._run_windows_bridge({"op": "ping"}, timeout=15)
-        self.assertTrue(first["ok"])
-
-        self.conn._bridge_daemon._proc.kill()
-        self.conn._bridge_daemon._proc.wait(timeout=5)
-
-        second = self.conn._run_windows_bridge({"op": "ping"}, timeout=15)
-
-        self.assertTrue(second["ok"])
-        self.assertNotEqual(
-            first["_bridge_process"]["pid"],
-            second["_bridge_process"]["pid"],
-            "a dead daemon should be replaced by a fresh process",
-        )
-
-    def test_daemon_disabled_falls_back_to_one_shot(self):
-        original_enabled = uc.WINDOWS_BRIDGE_DAEMON_ENABLED
-        original_run = uc.subprocess.run
-        calls = []
-        try:
-            uc.WINDOWS_BRIDGE_DAEMON_ENABLED = False
-
-            def fake_run(args, **kwargs):
-                calls.append(list(args))
-                return uc.subprocess.CompletedProcess(
-                    args,
-                    0,
-                    stdout=uc._WINDOWS_BRIDGE_RESULT_PREFIX
-                    + json.dumps({"ok": True, "nodes": []})
-                    + "\n",
-                    stderr="",
-                )
-
-            uc.subprocess.run = fake_run
-            result = self.conn._run_windows_bridge(
-                {"op": "discover", "group": ["239.0.0.1", 6766], "ttl": 1, "timeout": 0.1},
-                timeout=1,
-            )
-        finally:
-            uc.WINDOWS_BRIDGE_DAEMON_ENABLED = original_enabled
-            uc.subprocess.run = original_run
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(len(calls), 1)
-        self.assertIsNone(self.conn._bridge_daemon)
-
-    def test_two_connections_get_independent_daemons_and_one_disconnect_does_not_stop_the_other(self):
-        other = uc.UEConnection()
-        try:
-            first = self.conn._run_windows_bridge({"op": "ping"}, timeout=15)
-            second = other._run_windows_bridge({"op": "ping"}, timeout=15)
-
-            self.assertTrue(first["ok"])
-            self.assertTrue(second["ok"])
-            self.assertNotEqual(
-                first["_bridge_process"]["pid"],
-                second["_bridge_process"]["pid"],
-                "independent UEConnection instances should own separate bridge daemons",
-            )
-            self.assertIsNotNone(self.conn._bridge_daemon)
-            self.assertIsNotNone(other._bridge_daemon)
-            self.assertNotEqual(self.conn._bridge_daemon, other._bridge_daemon)
-
-            self.conn.disconnect()
-            self.assertIsNone(self.conn._bridge_daemon)
-
-            third = other._run_windows_bridge({"op": "ping"}, timeout=15)
-            self.assertTrue(third["ok"])
-            self.assertEqual(
-                second["_bridge_process"]["pid"],
-                third["_bridge_process"]["pid"],
-                "disconnecting one connection must not tear down another connection's bridge daemon",
-            )
-        finally:
-            other.disconnect()
-
-
-class BridgeNodeCacheTests(unittest.TestCase):
-    def _make_counting_connection(self):
-        class CountingBridgeConnection(uc.UEConnection):
-            def __init__(self):
-                super().__init__()
-                self.discover_calls = 0
-
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                if payload["op"] == "discover":
-                    self.discover_calls += 1
-                    return {
-                        "ok": True,
-                        "nodes": [{"node_id": "cached-node", "project_name": "P"}],
-                    }
-                raise AssertionError(payload)
-
-        conn = CountingBridgeConnection()
-        conn._running = True
-        return conn
-
-    def test_repeat_discovery_is_served_from_cache_within_ttl(self):
-        conn = self._make_counting_connection()
-
-        first = conn.get_remote_nodes()
-        second = conn.get_remote_nodes()
-
-        self.assertEqual(first[0]["node_id"], "cached-node")
-        self.assertEqual(second[0]["node_id"], "cached-node")
-        self.assertEqual(conn.discover_calls, 1)
-
-    def test_max_age_zero_bypasses_cache(self):
-        conn = self._make_counting_connection()
-
-        conn.get_remote_nodes()
-        conn._discover_windows_bridge_nodes(timeout=0.1, max_age=0.0)
-
-        self.assertEqual(conn.discover_calls, 2)
-
-
-class EditorBusyClassificationTests(unittest.TestCase):
-    """A busy game thread must read as 'editor busy', never 'no editor'."""
-
-    @staticmethod
-    def _fake_subprocess(stdout=None, raises=None):
-        class _Result:
-            def __init__(self, text):
-                self.stdout = text
-
-        class _FakeSubprocess:
-            def run(self, *args, **kwargs):
-                if raises is not None:
-                    raise raises
-                return _Result(stdout)
-
-        return _FakeSubprocess()
-
-    def test_bridge_process_check_reports_alive_dead_and_unknown(self):
-        ns = _exec_bridge_script()
-
-        ns["subprocess"] = self._fake_subprocess(
-            stdout='"UnrealEditor.exe","12345","Console","1","2,048,000 K"\n'
-        )
-        alive = ns["handle_request"]({"op": "process_check"})
-        self.assertTrue(alive["ok"])
-        self.assertIs(alive["editor_process_alive"], True)
-
-        ns["subprocess"] = self._fake_subprocess(
-            stdout="INFO: No tasks are running which match the specified criteria.\n"
-        )
-        dead = ns["handle_request"]({"op": "process_check"})
-        self.assertIs(dead["editor_process_alive"], False)
-
-        # tasklist unavailable (e.g. non-Windows): unknown, never an exception.
-        ns["subprocess"] = self._fake_subprocess(raises=FileNotFoundError("tasklist"))
-        unknown = ns["handle_request"]({"op": "process_check"})
-        self.assertTrue(unknown["ok"])
-        self.assertIsNone(unknown["editor_process_alive"])
-
-    def _make_connection(self, alive):
-        class BusyEditorConnection(uc.UEConnection):
-            def __init__(self):
-                super().__init__()
-                self.process_checks = 0
-
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                if payload["op"] == "discover":
-                    return {"ok": True, "nodes": []}
-                if payload["op"] == "process_check":
-                    self.process_checks += 1
-                    return {"ok": True, "editor_process_alive": alive}
-                raise AssertionError(payload)
-
-        conn = BusyEditorConnection()
-        conn._running = True  # skip real UDP discovery
-        return conn
-
-    def test_connect_reports_busy_when_process_alive_but_silent(self):
-        conn = self._make_connection(alive=True)
-
-        with self.assertRaises(uc.UENotRunningError) as ctx:
-            conn.connect(timeout=0.05)
-
-        self.assertIn("busy", str(ctx.exception))
-        self.assertIn("do not restart", str(ctx.exception))
-        self.assertEqual(conn.process_checks, 1)
-
-    def test_connect_keeps_plain_message_when_no_process(self):
-        conn = self._make_connection(alive=False)
-
-        with self.assertRaises(uc.UENotRunningError) as ctx:
-            conn.connect(timeout=0.05)
-
-        self.assertIn("No Unreal Editor instances discovered", str(ctx.exception))
-        self.assertNotIn("busy", str(ctx.exception))
-
-    def test_preflight_classifies_alive_but_silent(self):
-        conn = self._make_connection(alive=True)
-        conn._broadcast_ping = lambda *_args, **_kwargs: None  # no real UDP
-
-        result = conn.preflight_discovery(timeout=0.1, test_callback=False)
-
-        self.assertEqual(result["classification"], "EDITOR_PROCESS_ALIVE_BUT_SILENT")
-        self.assertIs(result["editor_process_alive"], True)
-        self.assertIn("busy", result["next_action"])
-
-
-class EditorRestartRecoveryTests(unittest.TestCase):
-    """First execute after an editor restart must transparently recover."""
-
-    def _make_connection(self, first_execute_result):
-        class RestartConnection(uc.UEConnection):
-            def __init__(self):
-                super().__init__()
-                self.execute_targets = []
-                self.discovers = 0
-
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                op = payload["op"]
-                if op == "discover":
-                    self.discovers += 1
-                    return {"ok": True, "nodes": [{"node_id": "B", "project_name": "P"}]}
-                if op == "execute":
-                    self.execute_targets.append(payload["node_id"])
-                    if payload["node_id"] == "A":
-                        return first_execute_result
-                    return {  # the restarted editor (node B) answers
-                        "ok": True,
-                        "result": {"success": True, "result": "",
-                                   "output": '__MCP_RESULT__{"ran": true}'},
-                    }
-                raise AssertionError(payload)
-
-        conn = RestartConnection()
-        conn._running = True
-        conn._windows_bridge_connected = True
-        conn._remote_node_id = "A"  # pinned to the editor that just restarted
-        return conn
-
-    def test_first_execute_after_restart_recovers_on_retry(self):
-        conn = self._make_connection({
-            "ok": False,
-            "error": "Unreal Editor did not connect back to the Windows bridge.",
-            "delivered": False,
-        })
-
-        result = conn.execute("print('hi')")
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["parsed"], {"ran": True})
-        # Tried the dead node, rediscovered, retried against the new node.
-        self.assertEqual(conn.execute_targets, ["A", "B"])
-        self.assertEqual(conn.discovers, 1)
-        self.assertEqual(conn._remote_node_id, "B")
-
-    def test_timeout_failure_never_retries(self):
-        # A timeout means the command may still be running on the game thread;
-        # re-running it (double execution) is the cardinal sin. No delivered
-        # flag -> no reconnect, no retry.
-        conn = self._make_connection({
-            "ok": False,
-            "error": "Command timed out: timed out",
-        })
-
-        with self.assertRaises(uc.UEConnectionError):
-            conn.execute("destroy_everything()")
-
-        self.assertEqual(conn.execute_targets, ["A"])  # exactly one attempt
-        self.assertEqual(conn.discovers, 0)
 
 
 class ScriptGuidanceTests(unittest.TestCase):
     def test_syntax_preflight_blocks_before_any_transport(self):
-        class NoTransportConnection(uc.UEConnection):
-            def _run_windows_bridge(self, payload, timeout=10.0):
+        class PoisonSocket:
+            def gettimeout(self):
                 raise AssertionError("transport must not be used for invalid syntax")
 
-        conn = NoTransportConnection()
-        conn._windows_bridge_connected = True
+            def settimeout(self, value):
+                raise AssertionError("transport must not be used for invalid syntax")
+
+            def sendall(self, data):
+                raise AssertionError("transport must not be used for invalid syntax")
+
+            def recv(self, size, flags=0):
+                raise AssertionError("transport must not be used for invalid syntax")
+
+            def close(self):
+                pass
+
+        conn = uc.UEConnection()
+        # Look connected on the direct path; preflight must reject the malformed
+        # script before any transport call touches this poison socket.
         conn._remote_node_id = "node-1"
+        conn._command_channel_socket = PoisonSocket()
 
         result = conn.execute("def broken(:\n    pass")
 
@@ -436,7 +129,7 @@ class ScriptGuidanceTests(unittest.TestCase):
 
 class RecvFramingTests(unittest.TestCase):
     def test_recv_json_message_survives_fragmentation_and_buffer_multiples(self):
-        namespace = _exec_bridge_script()
+        namespace = _exec_editor_protocol_script()
         recv_json_message = namespace["recv_json_message"]
         buffer_size = namespace["BUFFER_SIZE"]
 
@@ -523,7 +216,7 @@ class ExecutePythonAutoConnectTests(unittest.TestCase):
                 super().__init__()
                 self._running = True
 
-            def _windows_bridge_supported(self):
+            def _broker_supported(self):
                 return False
 
             def get_remote_nodes(self):
@@ -631,7 +324,7 @@ class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
         }).encode("utf-8")
 
     def test_post_send_failure_on_cached_channel_never_resends(self):
-        ns = _exec_bridge_script()
+        ns = _exec_editor_protocol_script()
 
         class PoisonedChannel:
             def __init__(self, response):
@@ -670,7 +363,7 @@ class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
         # sendall succeeds, then the peer closes before any response byte:
         # Unreal may have executed before dying, so this must NOT auto-retry
         # and must NOT be tagged delivered (would license a client retry).
-        ns = _exec_bridge_script()
+        ns = _exec_editor_protocol_script()
 
         class ClosedAfterSend:
             def __init__(self):
@@ -704,7 +397,7 @@ class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
         self.assertEqual(channel.sendall_count, 1)
 
     def test_one_shot_execute_tags_send_failure_delivered_false(self):
-        ns = _exec_bridge_script()
+        ns = _exec_editor_protocol_script()
 
         class DeadChannel:
             def sendall(self, data):
@@ -722,7 +415,7 @@ class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
         self.assertIs(result["delivered"], False)
 
     def test_pre_send_failure_on_cached_channel_retries_once(self):
-        ns = _exec_bridge_script()
+        ns = _exec_editor_protocol_script()
 
         class DeadChannel:
             def sendall(self, data):
@@ -767,7 +460,7 @@ class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
 
 class DaemonPingLivenessTests(unittest.TestCase):
     def test_ping_drops_dead_channels_and_keeps_live_ones(self):
-        ns = _exec_bridge_script()
+        ns = _exec_editor_protocol_script()
 
         live_a, live_b = socket.socketpair()
         dead_a, dead_b = socket.socketpair()
@@ -787,118 +480,6 @@ class DaemonPingLivenessTests(unittest.TestCase):
                     sock.close()
                 except OSError:
                     pass
-
-
-class LivenessFreshnessTests(unittest.TestCase):
-    def test_liveness_probe_never_trusts_the_node_cache(self):
-        class DeadEditorConnection(uc.UEConnection):
-            def __init__(self):
-                super().__init__()
-                self.discover_calls = 0
-
-            def _windows_bridge_supported(self):
-                return True
-
-            def _run_windows_bridge(self, payload, timeout=10.0):
-                self.discover_calls += 1
-                return {"ok": False, "error": "no editors"}
-
-        conn = DeadEditorConnection()
-        conn._remote_node_id = "node-x"
-        conn._windows_bridge_connected = True
-        conn._windows_bridge_node_ids = {"node-x"}
-        # Freshly cached discovery still lists the node: a dead editor must
-        # not be reported alive off the cache.
-        conn._windows_bridge_nodes = [{"node_id": "node-x"}]
-        conn._windows_bridge_nodes_at = time.time()
-
-        status = conn.get_status()
-
-        self.assertFalse(status["connected"])
-        self.assertGreaterEqual(conn.discover_calls, 1)
-        self.assertFalse(status["connection_liveness"]["ok"])
-
-
-class DaemonResponseGatingTests(unittest.TestCase):
-    """Late replies to abandoned requests must not accumulate in _responses."""
-
-    def _make_daemon_with_pipe(self):
-        daemon = uc._WindowsBridgeDaemon(["unused"], {"type": "direct_python"})
-        read_fd, write_fd = os.pipe()
-        reader = io.TextIOWrapper(io.FileIO(read_fd, "rb"), encoding="utf-8")
-        writer = io.TextIOWrapper(io.FileIO(write_fd, "wb"), encoding="utf-8")
-        sent_lines = []
-
-        fake_stdin = types.SimpleNamespace(
-            write=lambda line: sent_lines.append(line),
-            flush=lambda: None,
-            close=lambda: None,
-        )
-        daemon._proc = types.SimpleNamespace(
-            stdout=reader,
-            stderr=None,
-            stdin=fake_stdin,
-            poll=lambda: None,
-            pid=4242,
-        )
-        thread = threading.Thread(target=daemon._read_stdout, daemon=True)
-        thread.start()
-        return daemon, writer, sent_lines
-
-    def _reply(self, writer, request_id, extra=None):
-        payload = {"id": request_id, "ok": True}
-        payload.update(extra or {})
-        writer.write(uc._WINDOWS_BRIDGE_RESULT_PREFIX + json.dumps(payload) + "\n")
-        writer.flush()
-
-    def test_late_reply_after_timeout_is_dropped(self):
-        daemon, writer, sent_lines = self._make_daemon_with_pipe()
-        try:
-            result = daemon.request({"op": "slow"}, timeout=0.2)
-            self.assertIsNone(result)
-
-            request_id = json.loads(sent_lines[0])["id"]
-            self._reply(writer, request_id)
-
-            deadline = time.time() + 2.0
-            while time.time() < deadline and not daemon._eof:
-                with daemon._cond:
-                    if not daemon._pending and not daemon._responses:
-                        time.sleep(0.05)
-                # allow reader thread to consume the line
-                time.sleep(0.05)
-                break
-
-            with daemon._cond:
-                self.assertEqual(daemon._responses, {})
-                self.assertEqual(daemon._pending, set())
-        finally:
-            writer.close()
-            daemon._proc.stdout.close()
-
-    def test_prompt_reply_is_delivered_and_reclaimed(self):
-        daemon, writer, sent_lines = self._make_daemon_with_pipe()
-        try:
-            def responder():
-                deadline = time.time() + 2.0
-                while time.time() < deadline and not sent_lines:
-                    time.sleep(0.01)
-                request_id = json.loads(sent_lines[0])["id"]
-                self._reply(writer, request_id, {"op": "ping"})
-
-            thread = threading.Thread(target=responder)
-            thread.start()
-            result = daemon.request({"op": "ping"}, timeout=5.0)
-            thread.join(timeout=5)
-
-            self.assertIsNotNone(result)
-            self.assertTrue(result["ok"])
-            with daemon._cond:
-                self.assertEqual(daemon._responses, {})
-                self.assertEqual(daemon._pending, set())
-        finally:
-            writer.close()
-            daemon._proc.stdout.close()
 
 
 class _CapturingConnection:

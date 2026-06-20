@@ -221,14 +221,14 @@ Any agent can re-elect a dead broker; exactly one new broker comes up.
 
 ---
 
-## Scenario 11 — WSL fallback unchanged (only if you also run under WSL)
+## Scenario 11 — WSL is unsupported for the broker (only if you also run under WSL)
 
 **Steps**
-1. Run the MCP under WSL as before.
+1. Run the MCP under WSL.
 2. Call `connection_status`.
 
 **Expect**
-- `broker.supported=false`, `reason=wsl_uses_bridge`; the existing Windows-bridge path serves the connection exactly as it did pre-change (no regression). The broker is native-Windows-only by design.
+- `broker.supported=false`, `reason=wsl_unsupported`. The broker is native-Windows-only by design. The WSL→Windows subprocess bridge has been removed, so under WSL the server cannot discover an editor on the Windows host; launch the server via Windows Python (`pythonw.exe -m ue_ikrig_mcp`) instead.
 
 ---
 

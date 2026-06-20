@@ -9,11 +9,8 @@ import errno
 import os
 import sys
 import atexit
-import shutil
 import subprocess
-import tempfile
 from importlib import metadata as importlib_metadata
-from pathlib import Path
 from typing import Optional, Any
 
 # Protocol constants
@@ -29,10 +26,9 @@ _TYPE_COMMAND_RESULT = 'command_result'
 _NODE_PING_SECONDS = 1
 _NODE_TIMEOUT_SECONDS = 5
 _DEFAULT_RECEIVE_BUFFER_SIZE = 8192
-_WINDOWS_BRIDGE_RESULT_PREFIX = '__UE_IKRIG_MCP_BRIDGE_RESULT__'
 _PACKAGE_NAME = 'ue-ikrig-mcp'
 
-_WINDOWS_BRIDGE_SCRIPT = r'''
+_EDITOR_PROTOCOL_SCRIPT = r'''
 import json
 import os
 import socket
@@ -517,9 +513,19 @@ def editor_process_check():
     silent) from 'editor gone'. editor_process_alive is None when the check
     itself was impossible (e.g. tasklist unavailable)."""
     try:
+        # The server runs windowless (pythonw), so a child CONSOLE app like
+        # tasklist would flash a console window. Suppress it on Windows; on
+        # other platforms creationflags=0 / startupinfo=None are harmless.
+        _si = None
+        if os.name == 'nt':
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _si.wShowWindow = 0  # SW_HIDE
         out = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor*", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            startupinfo=_si,
         )
         alive = "UnrealEditor" in (out.stdout or "")
         return {"ok": True, "op": "process_check", "editor_process_alive": alive}
@@ -620,15 +626,24 @@ if __name__ == "__main__":
     main()
 '''
 
-_WINDOWS_BRIDGE_LAUNCHER_SCRIPT = (
-    "param([string]$ScriptPath, [string]$PayloadPath)\n"
-    "$ErrorActionPreference = 'Stop'\n"
-    "$py = Get-Command py -ErrorAction SilentlyContinue\n"
-    "if ($py) { & $py.Source -3 $ScriptPath $PayloadPath; exit $LASTEXITCODE }\n"
-    "$python = Get-Command python -ErrorAction SilentlyContinue\n"
-    "if ($python) { & $python.Source $ScriptPath $PayloadPath; exit $LASTEXITCODE }\n"
-    "throw 'Windows Python was not found on PATH.'\n"
-)
+_editor_protocol_ns: Optional[dict[str, Any]] = None
+
+
+def _editor_protocol_namespace() -> dict[str, Any]:
+    """Exec the editor-protocol script body once and cache its namespace.
+
+    Lets in-process callers (e.g. the editor-process-alive check) reuse the
+    VERBATIM ``editor_process_check`` / ``discover`` / ``daemon_execute`` /
+    ``close_all_channels`` definitions without duplicating them. The broker
+    execs the same script into its OWN private namespace (it owns a separate
+    CHANNELS/SOURCE_ID); this module-level cache is independent of that.
+    """
+    global _editor_protocol_ns
+    if _editor_protocol_ns is None:
+        ns: dict[str, Any] = {'__name__': 'ue_ikrig_mcp_editor_protocol'}
+        exec(_EDITOR_PROTOCOL_SCRIPT, ns)
+        _editor_protocol_ns = ns
+    return _editor_protocol_ns
 
 
 def _int_env(name: str, default: int) -> int:
@@ -661,24 +676,6 @@ def _bool_env(name: str, default: bool = False) -> bool:
     if normalized in {'0', 'false', 'no', 'off'}:
         return False
     return default
-
-
-def _write_temp_text(content: str, *, suffix: str, prefix: str) -> str:
-    with tempfile.NamedTemporaryFile(
-        'w',
-        suffix=suffix,
-        prefix=prefix,
-        delete=False,
-        encoding='utf-8',
-    ) as temp_file:
-        temp_file.write(content)
-        return temp_file.name
-
-
-def _windows_bridge_failure(error: str, **details: Any) -> dict[str, Any]:
-    result: dict[str, Any] = {'ok': False, 'error': error}
-    result.update(details)
-    return result
 
 
 def _split_address_list(raw: Optional[str], default: list[str]) -> list[str]:
@@ -861,187 +858,13 @@ def _callback_host_config_error(explicit_host: Optional[str]) -> Optional[str]:
     return None
 
 
-def _find_powershell_executable() -> Optional[str]:
-    powershell = shutil.which('powershell.exe')
-    if powershell:
-        return powershell
-    fallback = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
-    return fallback if os.path.exists(fallback) else None
-
-
-def _windows_path_to_wsl_executable_path(path: str) -> str:
-    """Return a WSL-executable path for a Windows executable path when obvious."""
-    value = path.strip().strip('"')
-    if len(value) >= 3 and value[1] == ':' and value[2] in ('\\', '/'):
-        drive = value[0].lower()
-        tail = value[3:].replace('\\', '/')
-        return f'/mnt/{drive}/{tail}'
-    return value
-
-
-def _candidate_windows_python_paths() -> list[tuple[str, str]]:
-    """Return explicit and common Windows Python candidates as (source, path)."""
-    candidates: list[tuple[str, str]] = []
-    for env_name in ('UE_WINDOWS_PYTHON', 'UE_WINDOWS_BRIDGE_PYTHON'):
-        configured = os.environ.get(env_name, '').strip()
-        if configured:
-            candidates.append((env_name, configured))
-
-    cwd = Path.cwd()
-    module_path = Path(__file__).resolve()
-    repo_candidates = [
-        cwd,
-        module_path.parents[2] if len(module_path.parents) > 2 else module_path.parent,
-    ]
-    for root in repo_candidates:
-        candidates.append(('repo .venv-win', str(root / '.venv-win' / 'Scripts' / 'python.exe')))
-
-    userprofile = os.environ.get('USERPROFILE', '').strip()
-    if userprofile:
-        candidates.append((
-            'USERPROFILE Python',
-            str(Path(_windows_path_to_wsl_executable_path(userprofile)) / 'AppData' / 'Local' / 'Python' / 'bin' / 'python.exe'),
-        ))
-
-    username = os.environ.get('USERNAME') or os.environ.get('USER')
-    if username:
-        candidates.extend([
-            (
-                'Windows user Python',
-                f'/mnt/c/Users/{username}/AppData/Local/Python/bin/python.exe',
-            ),
-            (
-                'Windows Store Python',
-                f'/mnt/c/Users/{username}/AppData/Local/Microsoft/WindowsApps/python.exe',
-            ),
-        ])
-
-    for executable in ('python.exe', 'py.exe'):
-        found = shutil.which(executable)
-        if found:
-            candidates.append((f'PATH {executable}', found))
-
-    return candidates
-
-
-def _windows_python_command(executable: str) -> list[str]:
-    """Return command argv for a Windows Python executable."""
-    command = [executable]
-    if os.path.basename(executable).lower() == 'py.exe':
-        command.append('-3')
-    return command
-
-
-def _is_explicit_windows_python_source(source: str) -> bool:
-    return source in {'UE_WINDOWS_PYTHON', 'UE_WINDOWS_BRIDGE_PYTHON'}
-
-
-def _windows_python_launcher_candidates() -> tuple[list[tuple[list[str], dict[str, Any]]], dict[str, Any]]:
-    """Return direct Windows Python launchers plus probe diagnostics."""
-    attempts: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    launchers: list[tuple[list[str], dict[str, Any]]] = []
-    candidate_paths = _candidate_windows_python_paths()
-    explicit_candidates = [
-        (source, candidate)
-        for source, candidate in candidate_paths
-        if _is_explicit_windows_python_source(source)
-    ]
-    candidates_to_probe = explicit_candidates or candidate_paths
-    explicit_configured = bool(explicit_candidates)
-    for source, candidate in candidates_to_probe:
-        executable = _windows_path_to_wsl_executable_path(candidate)
-        if executable in seen:
-            continue
-        seen.add(executable)
-        explicit = _is_explicit_windows_python_source(source)
-        attempt = {
-            'source': source,
-            'configured_path': candidate,
-            'executable_path': executable,
-            'explicit': explicit,
-            'exists': os.path.exists(executable),
-        }
-        attempts.append(attempt)
-        if attempt['exists']:
-            diagnostics = {
-                'type': 'direct_python',
-                'source': source,
-                'configured_path': candidate,
-                'executable_path': executable,
-                'explicit': explicit,
-                'attempts': attempts,
-            }
-            launchers.append((_windows_python_command(executable), diagnostics))
-            if explicit:
-                return launchers, {
-                    'type': 'direct_python_candidates',
-                    'attempts': attempts,
-                    'explicit_configured': True,
-                }
-    return launchers, {
-        'type': 'direct_python_candidates',
-        'attempts': attempts,
-        'explicit_configured': explicit_configured,
-    }
-
-
-def _find_windows_python_launcher() -> tuple[Optional[list[str]], dict[str, Any]]:
-    """Find the first Windows Python executable runnable from WSL for the bridge."""
-    launchers, diagnostics = _windows_python_launcher_candidates()
-    if launchers:
-        return launchers[0]
-    return None, {
-        'type': 'direct_python',
-        'source': None,
-        'error': 'No Windows Python executable found.',
-        'attempts': diagnostics.get('attempts', []),
-    }
-
-
-def _windows_bridge_launcher_candidates() -> tuple[list[tuple[list[str], dict[str, Any]]], dict[str, Any]]:
-    """Return ordered bridge launchers and diagnostics.
-
-    Explicit Windows Python configuration is authoritative. Auto-discovered
-    Python candidates may fall through to later candidates or PowerShell if the
-    selected executable fails before the bridge script emits a sentinel.
-    """
-    candidates, python_diagnostics = _windows_python_launcher_candidates()
-    explicit_configured = bool(python_diagnostics.get('explicit_configured'))
-    if explicit_configured:
-        return candidates, {
-            'type': 'bridge_launcher_candidates',
-            'python': python_diagnostics,
-            'powershell_skipped': 'explicit Windows Python configured',
-        }
-
-    powershell = _find_powershell_executable()
-    if powershell:
-        candidates.append(([powershell], {
-            'type': 'powershell_path_lookup',
-            'source': 'powershell.exe',
-            'executable_path': powershell,
-            'python': python_diagnostics,
-        }))
-    return candidates, {
-        'type': 'bridge_launcher_candidates',
-        'python': python_diagnostics,
-        'powershell': powershell,
-    }
-
-
-def _windows_bridge_launcher() -> tuple[Optional[list[str]], dict[str, Any]]:
-    candidates, diagnostics = _windows_bridge_launcher_candidates()
-    if candidates:
-        return candidates[0]
-    return None, {
-        'type': 'unavailable',
-        'error': 'Neither Windows Python nor powershell.exe was found.',
-        'diagnostics': diagnostics,
-    }
-
-
 def _wsl_path_to_windows(path: str) -> str:
+    """Translate a WSL path to its Windows form via ``wslpath -w``.
+
+    Used to tell a Windows-side editor where to read/write a file that the
+    server prepared on a shared filesystem. On native Windows ``wslpath`` is
+    absent, so the original path is returned unchanged (a safe no-op there).
+    """
     try:
         result = subprocess.run(
             ['wslpath', '-w', path],
@@ -1345,21 +1168,8 @@ MULTICAST_TTL = _int_env('UE_MULTICAST_TTL', _default_multicast_ttl())
 COMMAND_ENDPOINT = (os.environ.get('UE_COMMAND_HOST', '0.0.0.0'), _int_env('UE_COMMAND_PORT', 6777))
 COMMAND_PORT_STRICT = _bool_env('UE_COMMAND_PORT_STRICT', False)
 CALLBACK_HOST = os.environ.get('UE_CALLBACK_HOST', '').strip() or None
-WINDOWS_BRIDGE_ENABLED = _bool_env('UE_WINDOWS_BRIDGE', True)
-WINDOWS_BRIDGE_DISCOVERY_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_DISCOVERY_TIMEOUT', 5)
-WINDOWS_BRIDGE_EXEC_TIMEOUT = _int_env('UE_WINDOWS_BRIDGE_EXEC_TIMEOUT', 120)
-COMMAND_EXEC_TIMEOUT = max(1, _int_env('UE_COMMAND_EXEC_TIMEOUT', WINDOWS_BRIDGE_EXEC_TIMEOUT))
+COMMAND_EXEC_TIMEOUT = max(1, _int_env('UE_COMMAND_EXEC_TIMEOUT', 120))
 CONNECTION_STATUS_TIMEOUT = max(0.01, _float_env('UE_CONNECTION_STATUS_TIMEOUT', 0.25))
-# Persistent Windows bridge daemon (eliminates the per-call process spawn and
-# per-call UDP/TCP handshake). Falls back to one-shot subprocesses when off or
-# when no direct Windows Python launcher can host the daemon.
-WINDOWS_BRIDGE_DAEMON_ENABLED = _bool_env('UE_WINDOWS_BRIDGE_DAEMON', True)
-WINDOWS_BRIDGE_DAEMON_START_TIMEOUT = max(1.0, _float_env('UE_WINDOWS_BRIDGE_DAEMON_START_TIMEOUT', 15.0))
-WINDOWS_BRIDGE_DAEMON_COOLDOWN = max(1.0, _float_env('UE_WINDOWS_BRIDGE_DAEMON_COOLDOWN', 60.0))
-# Bridge discovery results are cached briefly so discover/connect/status calls
-# made back-to-back do not each pay a full discovery round.
-WINDOWS_BRIDGE_NODE_TTL = max(0.0, _float_env('UE_BRIDGE_NODE_CACHE_TTL', 5.0))
-WINDOWS_BRIDGE_EMPTY_NODE_TTL = max(0.0, _float_env('UE_BRIDGE_EMPTY_CACHE_TTL', 2.0))
 # Extra wait after the first discovery pong to catch additional editors.
 DISCOVERY_SETTLE_SECONDS = max(0.0, _float_env('UE_DISCOVERY_SETTLE', 0.25))
 # Local syntax check before shipping scripts to Unreal.
@@ -1369,8 +1179,7 @@ SCRIPT_PREFLIGHT_ENABLED = _bool_env('UE_SCRIPT_PREFLIGHT', True)
 # execute and the preflight handshake — funnel through one detached broker that
 # serializes every agent via result-frame-gated dispatch (see broker.py and
 # .omc/plans/multi-process-command-slot-arbitration.md). The broker is the fix
-# for cross-process editor-slot contention; WSL keeps the legacy bridge instead
-# (the broker targets the native direct path). If no broker can be reached or
+# for cross-process editor-slot contention. If no broker can be reached or
 # spawned, connect() falls back to today's per-process direct command channel and
 # get_status() surfaces broker.available == False (never a silent no-op).
 BROKER_ENABLED = _bool_env('UE_BROKER', True)
@@ -1507,203 +1316,6 @@ class _NodeSet:
                     del self._nodes[node_id]
 
 
-class _WindowsBridgeDaemon:
-    """Long-lived Windows-side bridge process speaking JSON lines over stdio.
-
-    One daemon replaces the spawn-per-call subprocess bridge: it keeps the
-    Windows Python interpreter warm and holds persistent TCP command channels
-    to editor nodes, so repeated execute calls skip both the process spawn and
-    the UDP open_connection handshake.
-
-    LEGACY (Option E2 / Phase E0): the bridge is retained as the WSL-only
-    transport (it is gated behind ``_is_wsl()`` in ``_windows_bridge_supported``
-    and is already structurally inactive on native Windows). On native Windows
-    the supported primary transport is the direct command channel funneled
-    through the shared broker (see ``broker.py``). Removing the bridge entirely
-    is a deferred follow-up; until then it serves WSL only.
-    """
-
-    def __init__(self, command: list[str], diagnostics: dict[str, Any]):
-        self.command = list(command)
-        self.diagnostics = dict(diagnostics)
-        self._proc: Optional[subprocess.Popen] = None
-        self._script_path: Optional[str] = None
-        self._responses: dict[str, dict[str, Any]] = {}
-        # Only responses for ids in _pending are stored: a late reply to a
-        # request that already timed out is dropped instead of accumulating.
-        self._pending: set[str] = set()
-        self._cond = threading.Condition()
-        self._write_lock = threading.Lock()
-        self._eof = False
-        self._stdout_tail: list[str] = []
-        self._stderr_tail: list[str] = []
-
-    @property
-    def pid(self) -> Optional[int]:
-        return self._proc.pid if self._proc is not None else None
-
-    def alive(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
-
-    def start(self, ready_timeout: float = WINDOWS_BRIDGE_DAEMON_START_TIMEOUT) -> bool:
-        if self._proc is not None:
-            # One instance hosts one process; callers create a fresh instance
-            # to restart (re-spawning here would orphan the previous child).
-            return self.alive()
-        self._script_path = _write_temp_text(
-            _WINDOWS_BRIDGE_SCRIPT,
-            suffix='.py',
-            prefix='ue_ikrig_mcp_bridge_daemon_',
-        )
-        script_win = _wsl_path_to_windows(self._script_path)
-        try:
-            self._proc = subprocess.Popen(
-                self.command + [script_win, '--daemon'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1,
-            )
-        except (OSError, subprocess.SubprocessError, ValueError) as e:
-            self.diagnostics['start_error'] = f'{type(e).__name__}: {e}'
-            self._proc = None
-            self._unlink_script()
-            return False
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
-        ready = self.request({'op': 'ping'}, timeout=ready_timeout)
-        if ready is None or not ready.get('ok'):
-            self.diagnostics['start_error'] = (
-                'Bridge daemon did not answer the readiness ping.'
-            )
-            self.stop()
-            return False
-        return True
-
-    def _read_stdout(self) -> None:
-        proc = self._proc
-        try:
-            for line in proc.stdout:
-                line = line.rstrip('\r\n')
-                if line.startswith(_WINDOWS_BRIDGE_RESULT_PREFIX):
-                    try:
-                        payload = json.loads(line[len(_WINDOWS_BRIDGE_RESULT_PREFIX):])
-                    except json.JSONDecodeError:
-                        continue
-                    request_id = payload.get('id')
-                    if request_id:
-                        with self._cond:
-                            if str(request_id) in self._pending:
-                                self._responses[str(request_id)] = payload
-                            self._cond.notify_all()
-                elif line:
-                    self._stdout_tail.append(line)
-                    del self._stdout_tail[:-20]
-        except (OSError, ValueError):
-            pass
-        finally:
-            with self._cond:
-                self._eof = True
-                self._cond.notify_all()
-
-    def _read_stderr(self) -> None:
-        proc = self._proc
-        try:
-            for line in proc.stderr:
-                line = line.rstrip('\r\n')
-                if line:
-                    self._stderr_tail.append(line)
-                    del self._stderr_tail[:-20]
-        except (OSError, ValueError):
-            pass
-
-    def request(self, payload: dict[str, Any], timeout: float) -> Optional[dict[str, Any]]:
-        """Send one request and wait for its response. None on timeout/death."""
-        proc = self._proc
-        if proc is None or proc.poll() is not None:
-            return None
-        request_id = str(uuid.uuid4())
-        # ensure_ascii so the request line survives any Windows pipe codepage.
-        line = json.dumps({**payload, 'id': request_id}, ensure_ascii=True)
-        with self._cond:
-            self._pending.add(request_id)
-        # Note: while the daemon is busy with a long command it does not read
-        # stdin, so a concurrent oversized request line can block here until
-        # the daemon loops back — head-of-line waiting, not a deadlock (the
-        # response reader runs on its own thread).
-        with self._write_lock:
-            try:
-                proc.stdin.write(line + '\n')
-                proc.stdin.flush()
-            except (OSError, ValueError):
-                with self._cond:
-                    self._pending.discard(request_id)
-                return None
-        deadline = time.time() + max(0.1, float(timeout))
-        with self._cond:
-            try:
-                while request_id not in self._responses:
-                    if self._eof:
-                        break
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        break
-                    self._cond.wait(timeout=min(0.25, remaining))
-                return self._responses.pop(request_id, None)
-            finally:
-                self._pending.discard(request_id)
-
-    def stop(self) -> None:
-        proc = self._proc
-        if proc is not None:
-            if proc.poll() is None:
-                with self._write_lock:
-                    try:
-                        proc.stdin.write(
-                            json.dumps({'op': 'shutdown', 'id': str(uuid.uuid4())}) + '\n'
-                        )
-                        proc.stdin.flush()
-                    except (OSError, ValueError):
-                        pass
-                    try:
-                        proc.stdin.close()
-                    except (OSError, ValueError):
-                        pass
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2.0)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-            for stream in (proc.stdout, proc.stderr, proc.stdin):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except (OSError, ValueError):
-                        pass
-            self._proc = None
-        self._unlink_script()
-
-    def _unlink_script(self) -> None:
-        if self._script_path:
-            try:
-                os.unlink(self._script_path)
-            except OSError:
-                pass
-            self._script_path = None
-
-    def tails(self) -> dict[str, Any]:
-        return {
-            'stdout_tail': list(self._stdout_tail),
-            'stderr_tail': list(self._stderr_tail),
-        }
-
-
 class UEConnection:
     """
     Manages discovery and command connection to an Unreal Editor instance
@@ -1759,13 +1371,6 @@ class UEConnection:
         self._last_udp_send_attempts: list[dict[str, Any]] = []
         self._last_ping_send_attempts: list[dict[str, Any]] = []
         self._last_callback_request: Optional[dict[str, Any]] = None
-        self._windows_bridge_node_ids: set[str] = set()
-        self._windows_bridge_nodes: list[dict[str, Any]] = []
-        self._windows_bridge_nodes_at: float = 0.0
-        self._windows_bridge_connected = False
-        self._last_windows_bridge_result: Optional[dict[str, Any]] = None
-        self._bridge_daemon: Optional[_WindowsBridgeDaemon] = None
-        self._bridge_daemon_cooldowns: dict[tuple[str, ...], float] = {}
         # Shared editor-command broker (Option E2). _broker_client is a thin
         # persistent loopback client to a detached broker that owns the single
         # editor command channel; None when the broker path is off, unavailable,
@@ -1969,29 +1574,14 @@ class UEConnection:
 
     def get_remote_nodes(self) -> list:
         """Return the currently discovered remote editor nodes."""
-        nodes = self._nodes.remote_nodes
-        if nodes:
-            return nodes
-        if self._windows_bridge_supported():
-            return self._discover_windows_bridge_nodes(
-                timeout=float(WINDOWS_BRIDGE_DISCOVERY_TIMEOUT),
-            )
-        return nodes
-
-    def _windows_bridge_supported(self) -> bool:
-        """Return True when WSL can delegate UE transport to Windows Python."""
-        if not WINDOWS_BRIDGE_ENABLED or not _is_wsl():
-            return False
-        launcher, _diagnostics = _windows_bridge_launcher()
-        return bool(launcher)
+        return self._nodes.remote_nodes
 
     def _broker_supported(self) -> bool:
         """Return True when this process should route through the shared broker.
 
         The broker owns the NATIVE direct command channel and serializes agents
-        machine-wide. WSL keeps the legacy Windows bridge instead (the broker
-        targets the native direct path, which on WSL is not the primary
-        transport), so the broker is gated off under WSL. Disabled via UE_BROKER.
+        machine-wide. It targets the native (non-WSL) direct path, so it is
+        gated off under WSL. Disabled via UE_BROKER.
         """
         return bool(BROKER_ENABLED and not _is_wsl())
 
@@ -2002,7 +1592,7 @@ class UEConnection:
         reason is recorded for get_status() (never a silent no-op)."""
         if not self._broker_supported():
             self._broker_unavailable_reason = (
-                'disabled' if not BROKER_ENABLED else 'wsl_uses_bridge'
+                'disabled' if not BROKER_ENABLED else 'wsl_unsupported'
             )
             return False
         reasons: list[str] = []
@@ -2087,278 +1677,6 @@ class UEConnection:
                 client.close()
             except Exception:
                 pass
-
-    def _ensure_bridge_daemon(
-        self,
-        launchers: list[tuple[list[str], dict[str, Any]]],
-    ) -> Optional[_WindowsBridgeDaemon]:
-        """Return a live bridge daemon, starting one if possible."""
-        daemon = self._bridge_daemon
-        if daemon is not None:
-            if daemon.alive():
-                return daemon
-            daemon.stop()
-            self._bridge_daemon = None
-        now = time.time()
-        for launcher, diagnostics in launchers:
-            if diagnostics.get('type') != 'direct_python':
-                # PowerShell-wrapped launchers stay on the one-shot path.
-                continue
-            key = tuple(launcher)
-            last_failure = self._bridge_daemon_cooldowns.get(key)
-            if last_failure is not None and (now - last_failure) < WINDOWS_BRIDGE_DAEMON_COOLDOWN:
-                continue
-            daemon = _WindowsBridgeDaemon(launcher, diagnostics)
-            if daemon.start():
-                self._bridge_daemon_cooldowns.pop(key, None)
-                self._bridge_daemon = daemon
-                return daemon
-            self._bridge_daemon_cooldowns[key] = now
-            daemon.stop()
-        return None
-
-    def _run_windows_bridge_via_daemon(
-        self,
-        payload: dict[str, Any],
-        timeout: float,
-        launchers: list[tuple[list[str], dict[str, Any]]],
-    ) -> Optional[dict[str, Any]]:
-        """Route a bridge request through the persistent daemon.
-
-        Returns None when no daemon is available (caller falls back to the
-        one-shot subprocess bridge); otherwise a bridge-shaped result dict.
-        """
-        daemon = self._ensure_bridge_daemon(launchers)
-        if daemon is None:
-            return None
-        result = daemon.request(payload, timeout=max(1.0, float(timeout)))
-        diagnostics = {
-            **daemon.diagnostics,
-            'transport': 'persistent_daemon',
-            'pid': daemon.pid,
-        }
-        if result is None:
-            tails = daemon.tails()
-            daemon.stop()
-            self._bridge_daemon = None
-            return _windows_bridge_failure(
-                f'Windows bridge timed out after {timeout} seconds.',
-                _bridge_launcher=diagnostics,
-                _bridge_process={'daemon': True, **tails},
-                _bridge_launcher_failures=[],
-            )
-        result.pop('id', None)
-        result.setdefault('ok', False)
-        result['_bridge_launcher'] = diagnostics
-        result['_bridge_process'] = {'daemon': True, 'pid': daemon.pid}
-        # Shape parity with the one-shot path.
-        result.setdefault('_bridge_launcher_failures', [])
-        return result
-
-    def _run_windows_bridge(self, payload: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
-        launchers, launcher_diagnostics = _windows_bridge_launcher_candidates()
-        if not launchers:
-            return {
-                'ok': False,
-                'error': 'Windows bridge launcher was not found.',
-                '_bridge_launcher': launcher_diagnostics,
-            }
-
-        if WINDOWS_BRIDGE_DAEMON_ENABLED:
-            daemon_result = self._run_windows_bridge_via_daemon(payload, timeout, launchers)
-            if daemon_result is not None:
-                self._last_windows_bridge_result = daemon_result
-                return daemon_result
-
-        script_path = ''
-        payload_path = ''
-        launcher_path = ''
-        launcher_failures: list[dict[str, Any]] = []
-        try:
-            script_path = _write_temp_text(
-                _WINDOWS_BRIDGE_SCRIPT,
-                suffix='.py',
-                prefix='ue_ikrig_mcp_bridge_',
-            )
-            payload_path = _write_temp_text(
-                json.dumps(payload, ensure_ascii=False),
-                suffix='.json',
-                prefix='ue_ikrig_mcp_bridge_payload_',
-            )
-            launcher_path = _write_temp_text(
-                _WINDOWS_BRIDGE_LAUNCHER_SCRIPT,
-                suffix='.ps1',
-                prefix='ue_ikrig_mcp_bridge_launcher_',
-            )
-
-            script_win = _wsl_path_to_windows(script_path)
-            payload_win = _wsl_path_to_windows(payload_path)
-            launcher_win = _wsl_path_to_windows(launcher_path)
-
-            for launcher, current_launcher_diagnostics in launchers:
-                if current_launcher_diagnostics.get('type') == 'direct_python':
-                    command = list(launcher) + [script_win, payload_win]
-                else:
-                    command = list(launcher) + [
-                        '-NoProfile',
-                        '-ExecutionPolicy',
-                        'Bypass',
-                        '-File',
-                        launcher_win,
-                        script_win,
-                        payload_win,
-                    ]
-                try:
-                    completed = subprocess.run(
-                        command,
-                        capture_output=True,
-                        text=True,
-                        errors='replace',
-                        timeout=max(1.0, float(timeout)),
-                    )
-                except subprocess.TimeoutExpired as e:
-                    result = _windows_bridge_failure(
-                        f'Windows bridge timed out after {timeout} seconds.',
-                        stdout=e.stdout,
-                        stderr=e.stderr,
-                        _bridge_launcher=current_launcher_diagnostics,
-                    )
-                except (OSError, subprocess.SubprocessError) as e:
-                    result = _windows_bridge_failure(
-                        f'{type(e).__name__}: {e}',
-                        _bridge_launcher=current_launcher_diagnostics,
-                    )
-                else:
-                    bridge_payload: Optional[dict[str, Any]] = None
-                    for line in reversed(completed.stdout.splitlines()):
-                        if line.startswith(_WINDOWS_BRIDGE_RESULT_PREFIX):
-                            try:
-                                bridge_payload = json.loads(line[len(_WINDOWS_BRIDGE_RESULT_PREFIX):])
-                            except json.JSONDecodeError as e:
-                                bridge_payload = {
-                                    'ok': False,
-                                    'error': f'Failed to parse Windows bridge result JSON: {e}',
-                                }
-                            break
-                    if bridge_payload is None:
-                        bridge_payload = {
-                            'ok': False,
-                            'error': 'Windows bridge did not emit a result sentinel.',
-                        }
-                    bridge_payload.setdefault('ok', False)
-                    bridge_payload['_bridge_launcher'] = current_launcher_diagnostics
-                    bridge_payload['_bridge_process'] = {
-                        'returncode': completed.returncode,
-                        'stdout_tail': completed.stdout[-2000:],
-                        'stderr_tail': completed.stderr[-2000:],
-                    }
-                    if completed.returncode != 0 and bridge_payload.get('ok'):
-                        bridge_payload['ok'] = False
-                        bridge_payload['error'] = (
-                            f'Windows bridge process exited with code {completed.returncode}.'
-                        )
-                    result = bridge_payload
-
-                result['_bridge_launcher_failures'] = list(launcher_failures)
-                launcher_failed_before_bridge = (
-                    not result.get('ok')
-                    and (
-                        result.get('error') == 'Windows bridge did not emit a result sentinel.'
-                        or str(result.get('error', '')).startswith('Windows bridge timed out')
-                        or str(result.get('error', '')).startswith(('TimeoutExpired:', 'OSError:', 'SubprocessError:'))
-                        or result.get('_bridge_process', {}).get('returncode', 0) != 0
-                    )
-                )
-                explicit = bool(current_launcher_diagnostics.get('explicit'))
-                if launcher_failed_before_bridge and not explicit:
-                    launcher_failures.append({
-                        'source': current_launcher_diagnostics.get('source'),
-                        'type': current_launcher_diagnostics.get('type'),
-                        'error': result.get('error'),
-                        'returncode': result.get('_bridge_process', {}).get('returncode'),
-                    })
-                    continue
-
-                result['_bridge_launcher_failures'] = list(launcher_failures)
-                self._last_windows_bridge_result = result
-                return result
-
-            result = _windows_bridge_failure(
-                'All Windows bridge launchers failed before emitting a bridge result.',
-                _bridge_launcher=launcher_diagnostics,
-                _bridge_launcher_failures=launcher_failures,
-            )
-            self._last_windows_bridge_result = result
-            return result
-        finally:
-            for path in (script_path, payload_path, launcher_path):
-                if path:
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-
-    def _discover_windows_bridge_nodes(
-        self,
-        timeout: float = 2.0,
-        max_age: Optional[float] = None,
-    ) -> list[dict[str, Any]]:
-        # Serve recent discovery results from cache so back-to-back
-        # discover/connect/status calls do not each pay a discovery round.
-        if max_age is None:
-            max_age = WINDOWS_BRIDGE_NODE_TTL if self._windows_bridge_nodes else WINDOWS_BRIDGE_EMPTY_NODE_TTL
-        if (
-            max_age > 0
-            and self._windows_bridge_nodes_at > 0
-            and (time.time() - self._windows_bridge_nodes_at) < max_age
-        ):
-            return list(self._windows_bridge_nodes)
-
-        result = self._run_windows_bridge(
-            {
-                'op': 'discover',
-                'group': list(self._multicast_group),
-                'ttl': max(1, int(self._multicast_ttl)),
-                'timeout': timeout,
-                'settle': DISCOVERY_SETTLE_SECONDS,
-            },
-            timeout=max(5.0, timeout + 3.0),
-        )
-        nodes: list[dict[str, Any]] = []
-        self._windows_bridge_node_ids = set()
-        if not result.get('ok'):
-            self._windows_bridge_nodes = []
-            self._windows_bridge_nodes_at = time.time()
-            return nodes
-        for node in result.get('nodes') or []:
-            if not isinstance(node, dict):
-                continue
-            node_id = node.get('node_id')
-            if not node_id:
-                continue
-            entry = dict(node)
-            entry['_transport'] = 'windows_subprocess'
-            nodes.append(entry)
-            self._windows_bridge_node_ids.add(str(node_id))
-        self._windows_bridge_nodes = nodes
-        self._windows_bridge_nodes_at = time.time()
-        return nodes
-
-    def _activate_windows_bridge_node(self, node_id: Optional[str]) -> bool:
-        if node_id is None or node_id not in self._windows_bridge_node_ids:
-            return False
-        self._remote_node_id = node_id
-        self._windows_bridge_connected = True
-        return True
-
-    def _discover_and_activate_windows_bridge_node(self, node_id: Optional[str]) -> bool:
-        if node_id is None or not self._windows_bridge_supported():
-            return False
-        if node_id not in self._windows_bridge_node_ids:
-            self._discover_windows_bridge_nodes(
-                timeout=float(WINDOWS_BRIDGE_DISCOVERY_TIMEOUT),
-            )
-        return self._activate_windows_bridge_node(node_id)
 
     # ------------------------------------------------------------------
     # Connection
@@ -2477,33 +1795,7 @@ class UEConnection:
             if parse_errors:
                 result['classification'] = 'PROTOCOL_VERSION_OR_MAGIC_MISMATCH'
             else:
-                bridge_nodes: list[dict[str, Any]] = []
-                bridge_result: Optional[dict[str, Any]] = None
-                if self._windows_bridge_supported():
-                    # Preflight is a doctor: always probe live, never serve cache.
-                    bridge_nodes = self._discover_windows_bridge_nodes(
-                        timeout=float(WINDOWS_BRIDGE_DISCOVERY_TIMEOUT),
-                        max_age=0.0,
-                    )
-                    bridge_result = self._last_windows_bridge_result
-                if bridge_result is not None:
-                    result['windows_bridge_result'] = bridge_result
-                if bridge_nodes:
-                    result.update({
-                        'ok': True,
-                        'classification': 'PONG_RECEIVED_VIA_WINDOWS_BRIDGE',
-                        'phase': 'windows_bridge_discovery',
-                        'nodes': bridge_nodes,
-                        'callback_classification': 'NOT_RUN_WINDOWS_BRIDGE_DISCOVERY_ONLY',
-                        'effective_config': self.get_status(),
-                        'next_action': (
-                            'Direct WSL UDP did not receive a pong, but Windows-side Python '
-                            'discovered Unreal. Use connect_to_editor/execute_python with the '
-                            'windows_subprocess transport.'
-                        ),
-                    })
-                    return result
-                # No pong anywhere. Busy editor vs absent editor changes the
+                # No pong. Busy editor vs absent editor changes the
                 # right next action completely - check the process.
                 editor_alive = self._editor_process_alive()
                 result['editor_process_alive'] = editor_alive
@@ -2589,12 +1881,15 @@ class UEConnection:
         return result
 
     def _editor_process_alive(self) -> Optional[bool]:
-        """True/False when the Windows bridge could check for a running
-        UnrealEditor process; None when unknown (no bridge, check failed)."""
-        if not self._windows_bridge_supported():
-            return None
+        """True/False when an in-process check could see a running UnrealEditor
+        process; None when unknown (check unavailable/failed).
+
+        Reuses the editor-protocol ``editor_process_check`` (a windowless
+        ``tasklist`` probe) VERBATIM, so it only reports a concrete answer on
+        native Windows; on other platforms tasklist is absent and it returns
+        None."""
         try:
-            result = self._run_windows_bridge({'op': 'process_check'}, timeout=15.0)
+            result = _editor_protocol_namespace()['editor_process_check']()
         except Exception:
             return None
         if not isinstance(result, dict) or not result.get('ok'):
@@ -2635,15 +1930,11 @@ class UEConnection:
         raise UEMultipleEditorsAmbiguousError(nodes)
 
     def _snapshot_discovered_nodes(self) -> list[dict[str, Any]]:
-        """Return known direct/bridge discovery nodes without forcing a new probe."""
+        """Return known direct discovery nodes without forcing a new probe."""
         by_id: dict[str, dict[str, Any]] = {}
         for node in self._nodes.remote_nodes:
             node_id = node.get('node_id')
             if node_id:
-                by_id[str(node_id)] = dict(node)
-        for node in self._windows_bridge_nodes:
-            node_id = node.get('node_id')
-            if node_id and str(node_id) not in by_id:
                 by_id[str(node_id)] = dict(node)
         return list(by_id.values())
 
@@ -2669,17 +1960,6 @@ class UEConnection:
             return
         if self.is_connected():
             self._cleanup_command_sockets()
-            self._windows_bridge_connected = False
-
-        if self._windows_bridge_supported():
-            if node_id is None:
-                bridge_nodes = self.get_remote_nodes()
-                if bridge_nodes:
-                    node_id = self._resolve_connect_node_id(None, bridge_nodes)
-            elif self._discover_and_activate_windows_bridge_node(node_id):
-                return
-            if self._activate_windows_bridge_node(node_id):
-                return
 
         # Native primary path (Option E2): funnel the direct command channel
         # through the shared broker so concurrent agents are serialized by
@@ -2692,11 +1972,7 @@ class UEConnection:
                 return
 
         if not self._running:
-            try:
-                self.start_discovery()
-            except UEConnectionError:
-                if not self._windows_bridge_supported():
-                    raise
+            self.start_discovery()
 
         # Resolve target node
         if node_id is None:
@@ -2714,11 +1990,6 @@ class UEConnection:
                 raise UENotRunningError(self._no_nodes_error())
 
         self._remote_node_id = node_id
-        if self._activate_windows_bridge_node(node_id):
-            return
-        if self._discover_and_activate_windows_bridge_node(node_id):
-            return
-
         self._open_command_channel_with_fallback(node_id)
 
     def _open_command_channel_with_fallback(
@@ -2828,7 +2099,7 @@ class UEConnection:
     # Command execution
     # ------------------------------------------------------------------
 
-    def _bridge_execute_payload(self, code: str, mode: str, command_timeout: float) -> dict[str, Any]:
+    def _command_execute_payload(self, code: str, mode: str, command_timeout: float) -> dict[str, Any]:
         # node_id is read live so a reconnect to a new editor retargets here.
         return {
             'op': 'execute',
@@ -2839,28 +2110,6 @@ class UEConnection:
             'mode': mode,
             'timeout': command_timeout,
         }
-
-    def _reconnect_after_restart(self) -> bool:
-        """Drop a stale pinned editor node and reconnect to the current one.
-
-        Called only when the last command provably never ran, so re-running it
-        on the new editor is safe. Forces a fresh discovery (bypasses the node
-        TTL cache, which may still list the dead editor). Returns True when the
-        Windows bridge is connected again."""
-        self._windows_bridge_connected = False
-        self._remote_node_id = None
-        self._mark_transport_disconnected()
-        self._windows_bridge_nodes_at = 0.0
-        self._windows_bridge_node_ids = set()
-        self._windows_bridge_nodes = []
-        # Also drop the direct-UDP registry so a stale node there cannot be
-        # re-pinned by connect() on non-bridge transports.
-        self._nodes = _NodeSet()
-        try:
-            self.connect()
-        except (UENotRunningError, UEConnectionError):
-            return False
-        return self._windows_bridge_connected
 
     def execute(self, code: str, mode: str = 'ExecuteFile', timeout: Optional[float] = None) -> dict:
         """
@@ -2888,7 +2137,7 @@ class UEConnection:
         if preflight_failure is not None:
             return preflight_failure
 
-        if self._command_channel_socket is not None and not self._windows_bridge_connected:
+        if self._command_channel_socket is not None:
             self._probe_direct_command_socket_liveness()
         if not self.is_connected():
             raise UEConnectionError(
@@ -2898,43 +2147,6 @@ class UEConnection:
 
         if self._broker_connected:
             return self._execute_via_broker(code, mode, timeout)
-
-        if self._windows_bridge_connected:
-            command_timeout = max(
-                0.1,
-                float(WINDOWS_BRIDGE_EXEC_TIMEOUT if timeout is None else timeout),
-            )
-            result = self._run_windows_bridge(
-                self._bridge_execute_payload(code, mode, command_timeout),
-                timeout=command_timeout + 5.0,
-            )
-            if result.get('error_code') == MULTIPLE_EDITORS_ERROR_CODE:
-                raise UEMultipleEditorsAmbiguousError(result.get('nodes') or [])
-            # First call after an editor restart hits a pinned node that no
-            # longer exists: the channel handshake never completes, so the
-            # command provably never ran (delivered is False). Rediscover the
-            # current editor and retry once instead of surfacing a spurious
-            # failure that only clears on the *next* call.
-            if (
-                not result.get('ok')
-                and result.get('delivered') is False
-                and self._reconnect_after_restart()
-            ):
-                result = self._run_windows_bridge(
-                    self._bridge_execute_payload(code, mode, command_timeout),
-                    timeout=command_timeout + 5.0,
-                )
-                if result.get('error_code') == MULTIPLE_EDITORS_ERROR_CODE:
-                    raise UEMultipleEditorsAmbiguousError(result.get('nodes') or [])
-            if not result.get('ok'):
-                self._windows_bridge_connected = False
-                self._mark_transport_disconnected()
-                error_text = str(result.get('error', 'unknown error'))
-                guidance = _TIMEOUT_GUIDANCE if 'timed out' in error_text.lower() else ''
-                raise UEConnectionError(
-                    f'Windows bridge command execution failed: {error_text}{guidance}'
-            )
-            return _normalize_command_result(result.get('result') or {})
 
         command_timeout = max(
             0.1,
@@ -3005,19 +2217,18 @@ class UEConnection:
     def _execute_via_broker(self, code: str, mode: str, timeout: Optional[float]) -> dict:
         """Run one command through the shared broker (Option E2 native path).
 
-        Mirrors the bridge-execute discipline: the broker runs daemon_execute
-        VERBATIM (no-double-execute), so this client NEVER resends after a send.
-        The only retry is the bridge's: when the broker reports the command
-        provably never reached the editor (delivered is False — a stale pinned
-        node after an editor restart), rediscover and retry ONCE. Every other
-        failure (timeout, post-send error, broker_busy backpressure) is surfaced,
-        never resent.
+        The broker runs daemon_execute VERBATIM (no-double-execute), so this
+        client NEVER resends after a send. The only retry: when the broker
+        reports the command provably never reached the editor (delivered is
+        False — a stale pinned node after an editor restart), rediscover and
+        retry ONCE. Every other failure (timeout, post-send error, broker_busy
+        backpressure) is surfaced, never resent.
         """
         command_timeout = max(
             0.1,
-            float(WINDOWS_BRIDGE_EXEC_TIMEOUT if timeout is None else timeout),
+            float(COMMAND_EXEC_TIMEOUT if timeout is None else timeout),
         )
-        payload = self._bridge_execute_payload(code, mode, command_timeout)
+        payload = self._command_execute_payload(code, mode, command_timeout)
         result = self._broker_request(payload, timeout=command_timeout + 5.0)
         if result is None:
             # The broker connection died with the command's fate unknown (it may
@@ -3031,7 +2242,7 @@ class UEConnection:
         self._last_broker_status = None
         # delivered is False ⇒ the command provably never reached the editor
         # (e.g. the pinned node died). Rediscover the current editor and retry
-        # once — the same provably-never-ran recovery the bridge path uses.
+        # once — the provably-never-ran recovery.
         # broker_busy (backpressure) and broker_poisoned (a contended slot whose
         # prior command may still be running) ALSO carry delivered=False, but an
         # auto-retry there would only re-hit the same condition — surface those
@@ -3043,7 +2254,7 @@ class UEConnection:
             and not result.get('broker_poisoned')
             and self._reconnect_after_restart_broker()
         ):
-            payload = self._bridge_execute_payload(code, mode, command_timeout)
+            payload = self._command_execute_payload(code, mode, command_timeout)
             retry = self._broker_request(payload, timeout=command_timeout + 5.0)
             if retry is not None:
                 result = retry
@@ -3089,7 +2300,6 @@ class UEConnection:
         """Close the command connection and stop discovery."""
         if (
             self._remote_node_id
-            and not self._windows_bridge_connected
             and not self._broker_connected
             and (self._broadcast_socket or self._broadcast_sockets)
         ):
@@ -3103,13 +2313,6 @@ class UEConnection:
         # would yank the editor slot out from under peer agents).
         self._teardown_broker_client()
         self._cleanup_command_sockets()
-        if self._bridge_daemon is not None:
-            try:
-                self._bridge_daemon.request({'op': 'close'}, timeout=2.0)
-            except Exception:
-                pass
-            self._bridge_daemon.stop()
-            self._bridge_daemon = None
         self._running = False
         if self._listen_thread:
             self._listen_thread.join(timeout=2.0)
@@ -3125,10 +2328,6 @@ class UEConnection:
         self._active_command_endpoint = self._configured_command_endpoint
         self._fallback_used = False
         self._fallback_reason = None
-        self._windows_bridge_connected = False
-        self._windows_bridge_node_ids = set()
-        self._windows_bridge_nodes = []
-        self._windows_bridge_nodes_at = 0.0
         self._broker_unavailable_reason = None
         self._last_broker_status = None
 
@@ -3147,10 +2346,9 @@ class UEConnection:
             self._command_listen_socket = None
 
     def is_connected(self) -> bool:
-        """Return True if a command transport (broker, bridge, or direct) is open."""
+        """Return True if a command transport (broker or direct) is open."""
         return (
             self._broker_connected
-            or self._windows_bridge_connected
             or self._command_channel_socket is not None
         )
 
@@ -3161,7 +2359,6 @@ class UEConnection:
     def _mark_transport_disconnected(self) -> None:
         if (
             not self._broker_connected
-            and not self._windows_bridge_connected
             and self._command_channel_socket is None
         ):
             self._remote_node_id = None
@@ -3243,86 +2440,6 @@ class UEConnection:
             'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
         }
 
-    def _probe_windows_bridge_liveness(self) -> dict[str, Any]:
-        node_id = self._remote_node_id
-        if not self._windows_bridge_connected or not node_id:
-            self._windows_bridge_connected = False
-            self._mark_transport_disconnected()
-            return {
-                'transport': 'windows_subprocess',
-                'ok': False,
-                'state': 'not_connected',
-                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
-            }
-
-        if not self._windows_bridge_supported():
-            self._windows_bridge_connected = False
-            self._mark_transport_disconnected()
-            return {
-                'transport': 'windows_subprocess',
-                'ok': False,
-                'state': 'bridge_unavailable',
-                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
-            }
-
-        # Fast path: ask the persistent daemon. An open command channel to the
-        # node is direct proof of liveness with no discovery round at all.
-        daemon = self._bridge_daemon
-        if WINDOWS_BRIDGE_DAEMON_ENABLED and daemon is not None and daemon.alive():
-            ping = daemon.request({'op': 'ping'}, timeout=max(1.0, CONNECTION_STATUS_TIMEOUT * 4))
-            if ping is not None and ping.get('ok'):
-                channels = ping.get('channels') or []
-                if node_id in channels:
-                    return {
-                        'transport': 'windows_subprocess',
-                        'ok': True,
-                        'state': 'daemon_channel_open',
-                        'node_id': node_id,
-                        'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
-                    }
-            else:
-                # Wedged daemon: clear it so the next call restarts cleanly.
-                daemon.stop()
-                self._bridge_daemon = None
-
-        # Liveness must be proven fresh: invalidate the node cache so the
-        # fallback discovery below cannot serve a stale (up to TTL-old) hit
-        # for an editor that just died. The cache timestamp is reset rather
-        # than passing max_age so subclass overrides of
-        # _discover_windows_bridge_nodes keep their (timeout) signature.
-        self._windows_bridge_nodes_at = 0.0
-        try:
-            nodes = self._discover_windows_bridge_nodes(timeout=CONNECTION_STATUS_TIMEOUT)
-        except Exception as e:
-            self._windows_bridge_connected = False
-            self._mark_transport_disconnected()
-            return {
-                'transport': 'windows_subprocess',
-                'ok': False,
-                'state': 'bridge_liveness_error',
-                'error': f'{type(e).__name__}: {e}',
-                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
-            }
-
-        if any(node.get('node_id') == node_id for node in nodes):
-            return {
-                'transport': 'windows_subprocess',
-                'ok': True,
-                'state': 'node_discovered',
-                'node_id': node_id,
-                'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
-            }
-
-        self._windows_bridge_connected = False
-        self._mark_transport_disconnected()
-        return {
-            'transport': 'windows_subprocess',
-            'ok': False,
-            'state': 'node_not_discovered',
-            'node_id': node_id,
-            'timeout_seconds': CONNECTION_STATUS_TIMEOUT,
-        }
-
     def _probe_broker_liveness(self) -> dict[str, Any]:
         client = self._broker_client
         if client is None or not self._broker_connected:
@@ -3362,8 +2479,6 @@ class UEConnection:
     def _refresh_connection_liveness(self) -> dict[str, Any]:
         if self._broker_connected:
             return self._probe_broker_liveness()
-        if self._windows_bridge_connected:
-            return self._probe_windows_bridge_liveness()
         if self._command_channel_socket is not None:
             return self._probe_direct_command_socket_liveness()
         self._mark_transport_disconnected()
@@ -3437,28 +2552,6 @@ class UEConnection:
         }
         if callback_config_error:
             status['callback']['config_error'] = callback_config_error
-        last_bridge_result = None
-        if self._last_windows_bridge_result is not None:
-            last_bridge_result = {
-                key: value
-                for key, value in self._last_windows_bridge_result.items()
-                if key not in {'traceback'}
-            }
-        bridge_launcher, bridge_launcher_diagnostics = _windows_bridge_launcher()
-        status['windows_bridge'] = {
-            'enabled': WINDOWS_BRIDGE_ENABLED,
-            'supported': bool(WINDOWS_BRIDGE_ENABLED and wsl_detected and bridge_launcher),
-            'connected': self._windows_bridge_connected,
-            'launcher': bridge_launcher_diagnostics,
-            'node_ids': sorted(self._windows_bridge_node_ids),
-            'nodes': list(self._windows_bridge_nodes),
-            'last_result': last_bridge_result,
-            'daemon': {
-                'enabled': WINDOWS_BRIDGE_DAEMON_ENABLED,
-                'running': bool(self._bridge_daemon is not None and self._bridge_daemon.alive()),
-                'pid': self._bridge_daemon.pid if self._bridge_daemon is not None else None,
-            },
-        }
         status['broker'] = self._broker_status_section()
         status['network'] = _network_diagnostics(self._multicast_group[0])
         return status
@@ -3467,7 +2560,7 @@ class UEConnection:
         """E4 observability for the shared editor-command broker.
 
         ``available`` is True only when this process holds a live broker client.
-        When False, ``reason`` says why (disabled / wsl_uses_bridge /
+        When False, ``reason`` says why (disabled / wsl_unsupported /
         no_broker_reachable_or_spawnable / a transport error) so a fallback to
         the per-process direct path is never a silent no-op. The dispatch fields
         (queue_depth / current_holder / result_frame_observed) come from the
