@@ -14,7 +14,7 @@ import json
 from mcp.types import TextContent
 
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string
+from ..ue_scripts import wrap_script, escape_string, safe_execute
 
 
 def _ok(data) -> list[TextContent]:
@@ -107,7 +107,7 @@ def register(server):
             '"succeeded": len(succeeded), "failed": failed'
             '}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -216,7 +216,7 @@ def register(server):
             "        result['warning'] = 'No Scale Source op found; cannot auto-apply'\n"
             'print("__MCP_RESULT__" + json.dumps(result))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -298,7 +298,7 @@ def register(server):
             '"saved": saved'
             '}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -376,5 +376,5 @@ def register(server):
             '"failed": failed[:10], "saved": saved'
             '}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

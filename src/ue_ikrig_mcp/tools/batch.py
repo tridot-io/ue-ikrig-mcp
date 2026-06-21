@@ -12,7 +12,7 @@ from ..ue_connection import (
     _invalid_execution_mode_result,
     _script_syntax_preflight,
 )
-from ..ue_scripts import wrap_script, escape_string, build_asset_registry_query
+from ..ue_scripts import wrap_script, escape_string, build_asset_registry_query, safe_execute
 from ..script_exec import (
     add_line_offset_hint,
     ensure_connected,
@@ -96,7 +96,7 @@ def register(server):
             "result_paths = [a.get_path_name() for a in duplicate_info] if duplicate_info else []\n"
             'print("__MCP_RESULT__" + json.dumps({"success": True, "output_assets": result_paths, "count": len(result_paths)}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -178,5 +178,5 @@ def register(server):
             return _err(str(e))
 
         script = build_asset_registry_query("/Script/Engine.SkeletalMesh", path_filter)
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

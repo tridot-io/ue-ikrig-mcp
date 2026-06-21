@@ -31,7 +31,7 @@ from pathlib import Path
 from mcp.types import TextContent
 
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string
+from ..ue_scripts import wrap_script, escape_string, safe_execute
 
 
 SCHEMA_VERSION = 1
@@ -424,7 +424,7 @@ def register(server):
             "    report['applied_sections'].append({'ops': applied_ops})\n"
             "print('__MCP_RESULT__' + json.dumps(report))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -636,5 +636,5 @@ def register(server):
             "    report['applied_sections'].append({'ops': applied_ops})\n"
             "print('__MCP_RESULT__' + json.dumps(report))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

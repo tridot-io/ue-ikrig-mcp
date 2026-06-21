@@ -22,7 +22,7 @@ import json
 from mcp.types import TextContent
 
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string
+from ..ue_scripts import wrap_script, escape_string, safe_execute
 
 
 def _ok(data) -> list[TextContent]:
@@ -86,7 +86,7 @@ def register(server):
             "}\n"
             'print("__MCP_RESULT__" + json.dumps(info))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -172,7 +172,7 @@ def register(server):
             "}\n"
             'print("__MCP_RESULT__" + json.dumps({"saved": saved, "after": after}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -226,7 +226,7 @@ def register(server):
             "        out.append({'goal_name': name, 'err': str(_e)[:100]})\n"
             'print("__MCP_RESULT__" + json.dumps({"goals": out}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -289,7 +289,7 @@ def register(server):
             "}\n"
             f'print("__MCP_RESULT__" + json.dumps({{"goal": "{gn}", "saved": saved, "after": after}}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -357,5 +357,5 @@ def register(server):
             f'saved = bool(ed.save_asset("{rp}", only_if_is_dirty=False))\n'
             'print("__MCP_RESULT__" + json.dumps({"saved": saved, "results": results}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

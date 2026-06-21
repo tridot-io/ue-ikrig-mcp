@@ -17,7 +17,7 @@ import json
 from mcp.types import TextContent
 
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string
+from ..ue_scripts import wrap_script, escape_string, safe_execute
 
 
 def _ok(data) -> list[TextContent]:
@@ -97,7 +97,7 @@ def register(server):
             "    'applied_settings': verify,\n"
             "}))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -169,7 +169,7 @@ def register(server):
             "    'applied_settings': verify,\n"
             "}))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -291,7 +291,7 @@ def register(server):
             "    'target_pelvis_bone': str(oc.get_target_pelvis_bone()),\n"
             "}))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -353,7 +353,7 @@ def register(server):
             "    'remaining_ops': remaining,\n"
             "}))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -414,5 +414,5 @@ def register(server):
             "    'ops': final_ops,\n"
             "}))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

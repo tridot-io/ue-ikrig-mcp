@@ -16,7 +16,7 @@ import json
 from mcp.types import TextContent
 
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string
+from ..ue_scripts import wrap_script, escape_string, safe_execute
 
 
 def _ok(data) -> list[TextContent]:
@@ -160,5 +160,5 @@ def register(server):
             '"failed_sample": failed[:10]'
             '}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

@@ -14,7 +14,7 @@ import json
 from mcp.types import TextContent
 
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string
+from ..ue_scripts import wrap_script, escape_string, safe_execute
 
 
 def _ok(data) -> list[TextContent]:
@@ -65,7 +65,7 @@ def register(server):
             "    out.append(entry)\n"
             'print("__MCP_RESULT__" + json.dumps({"binding_count": len(out), "bindings": out}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -138,5 +138,5 @@ def register(server):
             f'saved = bool(ed.save_asset("{ap}", only_if_is_dirty=False))\n'
             'print("__MCP_RESULT__" + json.dumps({"exported": bool(ok), "anim": anim.get_path_name(), "saved": saved}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

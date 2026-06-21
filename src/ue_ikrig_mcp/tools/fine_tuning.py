@@ -3,7 +3,7 @@
 import json
 from mcp.types import TextContent
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string, build_get_retargeter_controller
+from ..ue_scripts import wrap_script, escape_string, build_get_retargeter_controller, safe_execute
 
 
 def _ok(data) -> list[TextContent]:
@@ -49,7 +49,7 @@ def register(server):
             "rot = q.rotator()\n"
             'print("__MCP_RESULT__" + json.dumps({"rotation": {"x": q.x, "y": q.y, "z": q.z, "w": q.w}, "euler": {"pitch": rot.pitch, "yaw": rot.yaw, "roll": rot.roll}}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -88,7 +88,7 @@ def register(server):
             f'controller.set_rotation_offset_for_retarget_pose_bone("{bn}", new_quat, sot)\n'
             'print("__MCP_RESULT__" + json.dumps({"success": True, "bone": "' + bn + '", "rotation": {"x": ' + str(x) + ', "y": ' + str(y) + ', "z": ' + str(z) + ', "w": ' + str(w) + '}}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -133,7 +133,7 @@ def register(server):
             '"new_euler": {"pitch": new_rot.pitch, "yaw": new_rot.yaw, "roll": new_rot.roll}, '
             '"new_rotation": {"x": new_quat.x, "y": new_quat.y, "z": new_quat.z, "w": new_quat.w}}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -169,7 +169,7 @@ def register(server):
             "controller.set_root_offset_in_retarget_pose(offset, sot)\n"
             'print("__MCP_RESULT__" + json.dumps({"success": True, "offset": {"x": ' + str(x) + ', "y": ' + str(y) + ', "z": ' + str(z) + '}}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -204,7 +204,7 @@ def register(server):
             '"fk": {"enable_fk": fk.enable_fk, "rotation_alpha": fk.rotation_alpha, "translation_alpha": fk.translation_alpha}, '
             '"ik": {"enable_ik": ik.enable_ik, "blend_to_source": ik.blend_to_source}}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -254,7 +254,7 @@ def register(server):
             + f'controller.set_retarget_chain_settings("{cn}", settings)\n'
             'print("__MCP_RESULT__" + json.dumps({"success": True, "chain": "' + cn + '"}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -279,7 +279,7 @@ def register(server):
             "settings = controller.get_global_settings()\n"
             'print("__MCP_RESULT__" + json.dumps({"scale_horizontal": settings.scale_horizontal, "scale_vertical": settings.scale_vertical}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -322,7 +322,7 @@ def register(server):
             + "controller.set_global_settings(settings)\n"
             'print("__MCP_RESULT__" + json.dumps({"success": True}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -356,7 +356,7 @@ def register(server):
             f'controller.create_retarget_pose("{pn}", sot)\n'
             'print("__MCP_RESULT__" + json.dumps({"success": True, "pose_name": "' + pn + '", "side": "' + source_or_target + '"}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -390,7 +390,7 @@ def register(server):
             f'controller.set_current_retarget_pose("{pn}", sot)\n'
             'print("__MCP_RESULT__" + json.dumps({"success": True, "pose_name": "' + pn + '", "side": "' + source_or_target + '"}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -515,5 +515,5 @@ def register(server):
             "    'after': after,\n"
             "}))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

@@ -28,7 +28,7 @@ import json
 from mcp.types import TextContent
 
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string
+from ..ue_scripts import wrap_script, escape_string, safe_execute
 
 
 def _ok(data) -> list[TextContent]:
@@ -196,7 +196,7 @@ def register(server):
         # wrap_script prepends the json import + indents; our script is already
         # top-level, so pass it through its own wrapping path used by other tools.
         script = wrap_script(script)
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -270,7 +270,7 @@ def register(server):
             "    \"applied\": verify,\n"
             "}))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -338,5 +338,5 @@ def register(server):
             "    \"hint\": \"For feet-on-floor: pass -delta.z as z to set_ik_chain_static_offset on the matching leg chain.\",\n"
             "}))"
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

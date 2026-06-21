@@ -1,15 +1,24 @@
 """Optional TAPython adapter — exposes plugin-only capabilities when present.
 
-TAPython (a free community plugin) adds to UE's Python surface:
-  * AnimGraph node spawning and graph JSON I/O
-  * Active-viewport pixel capture (including asset editor viewports, which
-    stock UE exposes nothing for)
-  * Slate/UI tooling surface
+TAPython (a free community plugin) adds to UE's Python surface. What is and
+isn't usable through this MCP was verified live against TAPython 1.3.3 / UE 5.7:
 
-This module gates every call on `tapython_status().installed`. When TAPython
-is not installed in the running editor, each tool returns a clear error
-indicating what plugin is missing. Core ue-ikrig-mcp tools never require
-TAPython; this module is additive only.
+  * Active-viewport pixel capture (including asset editor viewports, which stock
+    UE exposes nothing for) — USABLE: it captures the focused editor viewport,
+    which matches an agent driving the editor interactively.
+  * Graph node spawning / inspection (`spawn_function_to_graph`,
+    `get_graph_panel_nodes`, `get_all_k2_nodes`) — NOT usable headlessly. These
+    are bound to interactive editor UI context, not to assets by path:
+    `spawn_function_to_graph`/`get_graph_panel_nodes` are instance methods on a
+    `ChameleonData` object tied to an open Chameleon tool's graph panel, and
+    `PythonBPAssetLib.get_all_k2_nodes()` takes NO arguments (it reads whatever
+    Blueprint graph is currently focused in the editor). The MCP operates on
+    assets by path over remote execution with no guaranteed open editor, so the
+    graph-authoring/inspection tools below report a clear capability error and
+    point at the headless alternative (the `cr_*` tools for Control Rig graphs).
+
+This module gates every call on `tapython_status().installed`. Core
+ue-ikrig-mcp tools never require TAPython; this module is additive only.
 
 Install: https://www.tacolor.xyz/  — add the TAPython plugin to the UE project,
 enable it, restart the editor.
@@ -24,7 +33,7 @@ import time
 from mcp.types import ImageContent, TextContent
 
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string
+from ..ue_scripts import wrap_script, escape_string, safe_execute
 
 
 def _ok(data) -> list[TextContent]:
@@ -35,24 +44,70 @@ def _err(msg: str) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"error": True, "message": msg}, indent=2))]
 
 
+# Why TAPython's graph APIs can't be driven by asset path through this MCP.
+# Verified live (TAPython 1.3.3, UE 5.7): spawn_function_to_graph /
+# get_graph_panel_nodes are ChameleonData *instance* methods bound to an open
+# Chameleon tool's graph panel, and PythonBPAssetLib.get_all_k2_nodes() takes no
+# arguments (it reads the currently-focused Blueprint editor graph).
+_GRAPH_CTX_NOTE = (
+    "TAPython's graph APIs are bound to interactive editor UI context, not to assets "
+    "by path. spawn_function_to_graph / get_graph_panel_nodes are instance methods on "
+    "a ChameleonData object tied to an open Chameleon tool's graph panel, and "
+    "PythonBPAssetLib.get_all_k2_nodes() takes no arguments (it reads whatever "
+    "Blueprint graph is currently focused in the editor). This MCP operates on assets "
+    "by path over remote execution with no guaranteed open editor, so it cannot target "
+    "an arbitrary AnimBlueprint/ControlRig asset graph this way. (Verified live against "
+    "TAPython 1.3.3 / UE 5.7.)"
+)
+_GRAPH_AUTHORING_UNAVAILABLE = (
+    "AnimGraph node authoring via TAPython is not available through this MCP. "
+    + _GRAPH_CTX_NOTE
+    + " For Control Rig graphs use the cr_* tools (RigVMController), which author nodes "
+    "headlessly. Stock UE exposes no Python API to create AnimGraph nodes."
+)
+_GRAPH_INSPECTION_UNAVAILABLE = (
+    "AnimGraph topology dump via TAPython is not available through this MCP. "
+    + _GRAPH_CTX_NOTE
+    + " For Control Rig graph inspection use cr_dump_graph."
+)
+
+
 _STATUS_SCRIPT = (
     "import unreal\n"
-    "info = {'installed': False, 'version': None, 'capabilities': []}\n"
-    "if hasattr(unreal, 'PythonBPLib'):\n"
-    "    info['installed'] = True\n"
-    "    pbl = unreal.PythonBPLib\n"
-    "    for m in ['spawn_function_to_graph', 'spawn_function_to_graph_with_spawner',\n"
-    "             'get_graph_panel_nodes', 'clear_graph_panel', 'get_graph_selected_node',\n"
-    "             'get_viewport_pixels', 'get_viewport_pixels_as_texture',\n"
-    "             'get_viewport_linear_color_pixels']:\n"
-    "        if hasattr(pbl, m):\n"
-    "            info['capabilities'].append(m)\n"
-    "    for vn in ['get_tapython_version', 'get_version']:\n"
+    "info = {'installed': False, 'version': None, 'libs': [], 'capabilities': {},\n"
+    "        'graph_api_note': 'Graph node APIs (spawn_function_to_graph, "
+    "get_graph_panel_nodes, get_all_k2_nodes) are bound to interactive editor UI / "
+    "Chameleon-tool context, not to assets by path; they cannot author or inspect an "
+    "arbitrary asset graph headlessly. Use the cr_* tools for Control Rig graphs.'}\n"
+    "info['installed'] = hasattr(unreal, 'PythonBPLib')\n"
+    "if info['installed']:\n"
+    "    for lib in ['PythonBPLib', 'PythonBPAssetLib', 'ChameleonData', 'PythonMeshLib',\n"
+    "                'PythonTextureLib', 'PythonWidgetLib', 'PythonMaterialLib',\n"
+    "                'PythonStructLib', 'PythonDataTableLib', 'PythonEnumLib',\n"
+    "                'PythonLevelLib', 'PythonTestLib']:\n"
+    "        if hasattr(unreal, lib):\n"
+    "            info['libs'].append(lib)\n"
+    "    try:\n"
+    "        _v = unreal.PythonBPLib.get_ta_python_version()\n"
     "        try:\n"
-    "            info['version'] = str(getattr(pbl, vn)())\n"
-    "            break\n"
-    "        except Exception: pass\n"
-    'print("__MCP_RESULT__" + json.dumps(info))\n'
+    "            info['version'] = _v if isinstance(_v, dict) else json.loads(str(_v))\n"
+    "        except Exception:\n"
+    "            info['version'] = str(_v)\n"
+    "    except Exception:\n"
+    "        info['version'] = None\n"
+    "    pbl = unreal.PythonBPLib\n"
+    "    cd = getattr(unreal, 'ChameleonData', None)\n"
+    "    bpa = getattr(unreal, 'PythonBPAssetLib', None)\n"
+    "    info['capabilities']['viewport_capture'] = any(hasattr(pbl, m) for m in\n"
+    "        ['get_viewport_pixels_as_data', 'get_viewport_pixels_as_texture', 'save_viewport_to_file'])\n"
+    "    info['capabilities']['chameleon_graph_panel'] = bool(cd is not None and hasattr(cd, 'spawn_function_to_graph'))\n"
+    "    info['capabilities']['k2_node_inspection_open_editor'] = bool(bpa is not None and hasattr(bpa, 'get_all_k2_nodes'))\n"
+    "    try:\n"
+    "        info['open_chameleon_tools'] = (list(pbl.get_all_chameleon_data_paths())\n"
+    "            if hasattr(pbl, 'get_all_chameleon_data_paths') else [])\n"
+    "    except Exception as _e:\n"
+    "        info['open_chameleon_tools'] = 'err:%s' % _e\n"
+    'print("__MCP_RESULT__" + json.dumps(info, default=str))\n'
 )
 
 
@@ -61,9 +116,13 @@ def register(server):
         name="tapython_status",
         description=(
             "Detect whether the TAPython plugin is installed in the running UE "
-            "editor and enumerate which capabilities it exposes. Use this before "
-            "calling any other tapython_* tool to gracefully degrade. Returns "
-            "{installed, version, capabilities}."
+            "editor and report what it can actually do through this MCP. Use this "
+            "before any other tapython_* tool to gracefully degrade. Returns "
+            "{installed, version, libs, capabilities, open_chameleon_tools, "
+            "graph_api_note}. Note: graph node authoring/inspection is NOT available "
+            "headlessly (the APIs are bound to interactive editor UI context); only "
+            "viewport_capture is generally usable. Use the cr_* tools for Control Rig "
+            "graphs."
         ),
     )
     async def tapython_status() -> list[TextContent]:
@@ -71,7 +130,7 @@ def register(server):
             conn = get_connection()
         except UENotRunningError as e:
             return _err(str(e))
-        result = conn.execute(wrap_script(_STATUS_SCRIPT))
+        result = safe_execute(conn, wrap_script(_STATUS_SCRIPT))
         return _ok(result)
 
     @server.tool(
@@ -93,48 +152,11 @@ def register(server):
         position_x: float = 0.0,
         position_y: float = 0.0,
     ) -> list[TextContent]:
-        try:
-            conn = get_connection()
-        except UENotRunningError as e:
-            return _err(str(e))
-
-        p = escape_string(anim_bp_path)
-        ncn = escape_string(node_class_name)
-        gn = escape_string(graph_name)
-
-        script = wrap_script(
-            "import unreal\n"
-            "if not hasattr(unreal, 'PythonBPLib'):\n"
-            '    raise ValueError("TAPython plugin not installed; call tapython_status to diagnose")\n'
-            "pbl = unreal.PythonBPLib\n"
-            "if not hasattr(pbl, 'spawn_function_to_graph'):\n"
-            '    raise ValueError("TAPython installed but spawn_function_to_graph unavailable; plugin may be older than required")\n'
-            f'abp = unreal.load_asset("{p}")\n'
-            "if abp is None:\n"
-            f'    raise ValueError("AnimBlueprint not found: {p}")\n'
-            "if type(abp).__name__ != 'AnimBlueprint':\n"
-            '    raise ValueError(f"Asset is not an AnimBlueprint: {type(abp).__name__}")\n'
-            f'_gn = "{gn}"\n'
-            "graph = None\n"
-            "for g in abp.get_animation_graphs():\n"
-            "    if g.get_name() == _gn:\n"
-            "        graph = g; break\n"
-            "if graph is None:\n"
-            f'    raise ValueError(f"AnimGraph {{_gn!r}} not found on {p}")\n'
-            f'node = pbl.spawn_function_to_graph(graph, "{ncn}", unreal.Vector2D({float(position_x)}, {float(position_y)}))\n'
-            "if node is None:\n"
-            f'    raise ValueError("spawn_function_to_graph returned None for class {ncn} (name may be invalid or not permissible in AnimGraph)")\n'
-            "abp.modify()\n"
-            "ed = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)\n"
-            f'saved = bool(ed.save_asset("{p}", only_if_is_dirty=False))\n'
-            'print("__MCP_RESULT__" + json.dumps({'
-            '"graph": _gn, "spawned_node": node.get_name(),'
-            '"class": type(node).__name__, "saved": saved,'
-            '"note": "Recompile the AnimBlueprint (editor Compile button or BlueprintEditorLibrary.compile_blueprint) to pick up the new node at runtime."'
-            '}))'
-        )
-        result = conn.execute(script)
-        return _ok(result)
+        # Not achievable headlessly — see _GRAPH_CTX_NOTE. The previously-shipped
+        # implementation called unreal.PythonBPLib.spawn_function_to_graph, which
+        # does not exist on PythonBPLib (the method is a ChameleonData instance
+        # method), so it always failed; this returns an accurate capability error.
+        return _err(_GRAPH_AUTHORING_UNAVAILABLE)
 
     @server.tool(
         name="tapython_capture_active_viewport",
@@ -235,53 +257,12 @@ def register(server):
         graph_name: str = "AnimGraph",
         out_path: str = "",
     ) -> list[TextContent]:
-        try:
-            conn = get_connection()
-        except UENotRunningError as e:
-            return _err(str(e))
-
-        p = escape_string(anim_bp_path)
-        gn = escape_string(graph_name)
-        op = escape_string(out_path) if out_path else ""
-
-        script = wrap_script(
-            "import unreal\n"
-            "import json as _json\n"
-            "import os as _os\n"
-            "if not hasattr(unreal, 'PythonBPLib'):\n"
-            '    raise ValueError("TAPython plugin not installed; call tapython_status to diagnose")\n'
-            "pbl = unreal.PythonBPLib\n"
-            "if not hasattr(pbl, 'get_graph_panel_nodes'):\n"
-            '    raise ValueError("TAPython installed but get_graph_panel_nodes unavailable")\n'
-            f'abp = unreal.load_asset("{p}")\n'
-            "if abp is None:\n"
-            f'    raise ValueError("AnimBlueprint not found: {p}")\n'
-            f'_gn = "{gn}"\n'
-            "graph = None\n"
-            "for g in abp.get_animation_graphs():\n"
-            "    if g.get_name() == _gn:\n"
-            "        graph = g; break\n"
-            "if graph is None:\n"
-            f'    raise ValueError(f"AnimGraph {{_gn!r}} not found on {p}")\n'
-            "nodes_data = pbl.get_graph_panel_nodes(graph)\n"
-            # TAPython returns a JSON-ish structure; coerce to serializable form
-            "try:\n"
-            "    dump = _json.loads(nodes_data) if isinstance(nodes_data, str) else nodes_data\n"
-            "except Exception:\n"
-            "    dump = str(nodes_data)\n"
-            "payload = {'anim_bp': abp.get_path_name(), 'graph': _gn, 'nodes': dump}\n"
-            f'_out = r"{op}"\n'
-            "if _out:\n"
-            "    _os.makedirs(_os.path.dirname(_out) or '.', exist_ok=True)\n"
-            "    with open(_out, 'w', encoding='utf-8') as _f:\n"
-            "        _json.dump(payload, _f, indent=2, ensure_ascii=False)\n"
-            "    result = {'out_path': _out, 'node_count': len(dump) if hasattr(dump, '__len__') else None}\n"
-            "else:\n"
-            "    result = {'inline': payload, 'node_count': len(dump) if hasattr(dump, '__len__') else None}\n"
-            'print("__MCP_RESULT__" + json.dumps(result))'
-        )
-        result = conn.execute(script)
-        return _ok(result)
+        # Not achievable headlessly — see _GRAPH_CTX_NOTE. get_graph_panel_nodes is
+        # a ChameleonData instance method (open Chameleon tool panel) and
+        # get_all_k2_nodes() takes no args (reads the focused editor graph); neither
+        # can dump an arbitrary AnimBlueprint asset by path. The prior implementation
+        # called unreal.PythonBPLib.get_graph_panel_nodes, which does not exist.
+        return _err(_GRAPH_INSPECTION_UNAVAILABLE)
 
     @server.tool(
         name="tapython_apply_animgraph_json",
@@ -297,58 +278,8 @@ def register(server):
         graph_name: str = "AnimGraph",
         dry_run: bool = True,
     ) -> list[TextContent]:
-        try:
-            conn = get_connection()
-        except UENotRunningError as e:
-            return _err(str(e))
-
-        p = escape_string(anim_bp_path)
-        ip = escape_string(in_path)
-        gn = escape_string(graph_name)
-        dr = "True" if dry_run else "False"
-
-        script = wrap_script(
-            "import unreal\n"
-            "import json as _json\n"
-            "if not hasattr(unreal, 'PythonBPLib'):\n"
-            '    raise ValueError("TAPython plugin not installed")\n'
-            "pbl = unreal.PythonBPLib\n"
-            f'abp = unreal.load_asset("{p}")\n'
-            "if abp is None:\n"
-            f'    raise ValueError("AnimBlueprint not found: {p}")\n'
-            f'with open(r"{ip}", "r", encoding="utf-8") as _f:\n'
-            "    payload = _json.load(_f)\n"
-            f'_gn = "{gn}"\n'
-            f"dry = {dr}\n"
-            "graph = None\n"
-            "for g in abp.get_animation_graphs():\n"
-            "    if g.get_name() == _gn:\n"
-            "        graph = g; break\n"
-            "if graph is None:\n"
-            f'    raise ValueError(f"AnimGraph {{_gn!r}} not found on {p}")\n'
-            "existing = pbl.get_graph_panel_nodes(graph) if hasattr(pbl, 'get_graph_panel_nodes') else None\n"
-            "nodes_spec = payload.get('nodes', [])\n"
-            "plan = []\n"
-            "created = []\n"
-            "for entry in (nodes_spec if isinstance(nodes_spec, list) else []):\n"
-            "    cls = entry.get('class') or entry.get('node_class')\n"
-            "    if not cls:\n"
-            "        plan.append({'skipped': True, 'entry': entry, 'reason': 'no class/node_class key'})\n"
-            "        continue\n"
-            "    plan.append({'create': cls, 'position': entry.get('position')})\n"
-            "    if not dry and hasattr(pbl, 'spawn_function_to_graph'):\n"
-            "        pos = entry.get('position') or [0, 0]\n"
-            "        try:\n"
-            "            node = pbl.spawn_function_to_graph(graph, cls, unreal.Vector2D(float(pos[0]), float(pos[1])))\n"
-            "            created.append({'class': cls, 'name': node.get_name() if node else None})\n"
-            "        except Exception as e:\n"
-            "            created.append({'class': cls, 'err': str(e)[:120]})\n"
-            "result = {'dry_run': dry, 'plan': plan, 'created': created}\n"
-            "if not dry:\n"
-            "    abp.modify()\n"
-            "    ed = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)\n"
-            f'    result["saved"] = bool(ed.save_asset("{p}", only_if_is_dirty=False))\n'
-            'print("__MCP_RESULT__" + json.dumps(result))'
-        )
-        result = conn.execute(script)
-        return _ok(result)
+        # Not achievable headlessly — see _GRAPH_CTX_NOTE. Applying a graph spec
+        # requires spawn_function_to_graph, a ChameleonData instance method that
+        # cannot target an AnimBlueprint asset by path. The prior implementation
+        # called the non-existent unreal.PythonBPLib.spawn_function_to_graph.
+        return _err(_GRAPH_AUTHORING_UNAVAILABLE)

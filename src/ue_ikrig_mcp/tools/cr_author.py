@@ -26,7 +26,7 @@ import json
 from mcp.types import TextContent
 
 from ..ue_connection import get_connection, UENotRunningError
-from ..ue_scripts import wrap_script, escape_string
+from ..ue_scripts import wrap_script, escape_string, safe_execute, validate_cpp_type
 
 
 def _ok(data) -> list[TextContent]:
@@ -91,7 +91,7 @@ def register(server):
             "unreal.EditorAssetLibrary.save_asset(rig_path)\n"
             'print("__MCP_RESULT__" + json.dumps({"rig_path": rig_bp.get_path_name()}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     @server.tool(
         name="cr_delete_blueprint",
@@ -111,7 +111,7 @@ def register(server):
             "    deleted = bool(unreal.EditorAssetLibrary.delete_asset(rig_path))\n"
             'print("__MCP_RESULT__" + json.dumps({"deleted": deleted}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     # ------------------------------------------------------------------
     # Variables (BP-level inputs that the owning AnimBP writes per frame)
@@ -134,6 +134,12 @@ def register(server):
         is_input: bool = True,
         default_value: str = "",
     ) -> list[TextContent]:
+        # D1: an unrecognised cpp_type trips a C++ check inside add_member_variable
+        # that hard-crashes the editor (the editor-side try/except below cannot catch
+        # a native assert), so reject bad types here before sending anything.
+        bad = validate_cpp_type(cpp_type)
+        if bad:
+            return _err(bad)
         try:
             conn = get_connection()
         except UENotRunningError as e:
@@ -162,7 +168,7 @@ def register(server):
             "unreal.EditorAssetLibrary.save_asset(rig_path)\n"
             'print("__MCP_RESULT__" + json.dumps({"added": ok, "name": name, "cpp_type": tp}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     # ------------------------------------------------------------------
     # Graph mutation: add nodes, set pin defaults, add links
@@ -222,7 +228,7 @@ def register(server):
             '    raise RuntimeError(f"add_unit_node failed across {paths}: {last_err}")\n'
             'print("__MCP_RESULT__" + json.dumps({"node": added.get_node_path(), "struct_path": used_path}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     @server.tool(
         name="cr_add_array_op_node",
@@ -232,10 +238,14 @@ def register(server):
             "have static struct paths (they're dispatch nodes, element-type-parameterized).\n\n"
             "op_code: name of an RigVMOpCode enum value. Common: 'ARRAY_GET_AT_INDEX', "
             "'ARRAY_SET_AT_INDEX', 'ARRAY_ADD', 'ARRAY_GET_NUM', 'ARRAY_ITERATOR'.\n\n"
-            "element_cpp_type: the ELEMENT type, not the array. 'float', 'int32', 'FVector', "
-            "'FName', 'FTransform', 'FRigElementKey'.\n\n"
+            "element_cpp_type: the ELEMENT type, not the array. For PRIMITIVES pass it "
+            "alone: 'float', 'int32', 'FVector', 'FName', 'FTransform'. For a STRUCT/ENUM "
+            "element (e.g. 'FRigElementKey') you must ALSO pass element_cpp_type_object "
+            "(below) — a bare unrecognized type string is refused because it can crash "
+            "the editor.\n\n"
             "element_cpp_type_object: asset path for struct/enum element types. E.g. for "
-            "FRigElementKey use '/Script/ControlRig.RigElementKey'. Empty for primitives.\n\n"
+            "an FRigElementKey element pass element_cpp_type='FRigElementKey' AND "
+            "element_cpp_type_object='/Script/ControlRig.RigElementKey'. Empty for primitives.\n\n"
             "These enums are marked deprecated in some UE versions (5.5+) but still "
             "functional — the modern replacement is DISPATCH_RigVMDispatch_Array* which "
             "also works via this call."
@@ -250,6 +260,20 @@ def register(server):
         pos_y: float = 0.0,
         element_cpp_type_object: str = "",
     ) -> list[TextContent]:
+        # D1: a junk element type can hard-crash the editor (native check). When an
+        # object path is supplied it is the authority for struct/enum elements, so we
+        # only require it to look like a real object path; otherwise the element type
+        # must be a known scalar/container.
+        if element_cpp_type_object.strip():
+            if not element_cpp_type_object.strip().startswith(("/Script/", "/Game/")):
+                return _err(
+                    "element_cpp_type_object must be a '/Script/...' or '/Game/...' "
+                    "path, got %r" % element_cpp_type_object
+                )
+        else:
+            bad = validate_cpp_type(element_cpp_type)
+            if bad:
+                return _err(bad)
         try:
             conn = get_connection()
         except UENotRunningError as e:
@@ -285,7 +309,7 @@ def register(server):
             '    raise RuntimeError("add_array_node returned None")\n'
             'print("__MCP_RESULT__" + json.dumps({"node": n.get_node_path(), "op": op_name, "element_type": cpp_type}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     @server.tool(
         name="cr_add_template_node",
@@ -322,7 +346,7 @@ def register(server):
             '    raise RuntimeError("add_template_node returned None")\n'
             'print("__MCP_RESULT__" + json.dumps({"node": n.get_node_path(), "template": notation}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     @server.tool(
         name="cr_add_variable_node",
@@ -341,6 +365,11 @@ def register(server):
         pos_y: float = 0.0,
         node_name: str = "",
     ) -> list[TextContent]:
+        # D1: gate the type string before it reaches add_variable_node (native crash
+        # risk on an unrecognised type).
+        bad = validate_cpp_type(cpp_type)
+        if bad:
+            return _err(bad)
         try:
             conn = get_connection()
         except UENotRunningError as e:
@@ -365,7 +394,7 @@ def register(server):
             '    raise RuntimeError("add_variable_node returned None")\n'
             'print("__MCP_RESULT__" + json.dumps({"node": n.get_node_path()}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     @server.tool(
         name="cr_set_pin_default",
@@ -401,7 +430,7 @@ def register(server):
             "ok = ctrl.set_pin_default_value(pin_path, value, ra)\n"
             'print("__MCP_RESULT__" + json.dumps({"set": bool(ok), "pin": pin_path}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     @server.tool(
         name="cr_add_link",
@@ -433,7 +462,7 @@ def register(server):
             "ok = ctrl.add_link(fp, tp)\n"
             'print("__MCP_RESULT__" + json.dumps({"linked": bool(ok), "from": fp, "to": tp}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     # ------------------------------------------------------------------
     # Introspection / finalize
@@ -482,7 +511,7 @@ def register(server):
             "    links_out.append({'err': str(e)})\n"
             'print("__MCP_RESULT__" + json.dumps({"node_count": len(nodes_out), "nodes": nodes_out[:200], "link_count": len(links_out), "links": links_out[:400]}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))
 
     @server.tool(
         name="cr_compile_and_save",
@@ -568,4 +597,4 @@ def register(server):
             '"success": _success, "log_file": active_log'
             '}))'
         )
-        return _ok(conn.execute(script))
+        return _ok(safe_execute(conn, script))

@@ -8,6 +8,7 @@ from ..ue_scripts import (
     escape_string,
     build_create_retargeter,
     build_save_asset,
+    safe_execute,
 )
 
 
@@ -37,7 +38,10 @@ def register(server):
             return _err(str(e))
 
         script = build_create_retargeter(package_path, asset_name)
-        result = conn.execute(script)
+        # safe_execute returns the payload on success, or {"error": True, ...} on
+        # editor-side / transport failure — so this guard now actually fires (a raw
+        # transport dict carries failures under .parsed, not a top-level "error").
+        result = safe_execute(conn, script)
         if isinstance(result, dict) and result.get("error"):
             return _ok(result)
 
@@ -73,7 +77,7 @@ def register(server):
                 ]
             lines.append('print("__MCP_RESULT__" + json.dumps({"success": True, "path": retargeter.get_path_name()}))')
             set_rigs_script = wrap_script("".join(lines))
-            result2 = conn.execute(set_rigs_script)
+            result2 = safe_execute(conn, set_rigs_script)
             return _ok(result2)
 
         return _ok(result)
@@ -109,7 +113,7 @@ def register(server):
             '"chain_mappings": mappings'
             '}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -147,7 +151,7 @@ def register(server):
             f"controller.set_ik_rig({enum_val}, ik_rig)\n"
             'print("__MCP_RESULT__" + json.dumps({"success": True, "side": "' + source_or_target + '", "ik_rig": ik_rig.get_path_name()}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -182,7 +186,7 @@ def register(server):
             "    })\n"
             'print("__MCP_RESULT__" + json.dumps({"success": True, "mappings": mappings}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -211,7 +215,7 @@ def register(server):
             f'controller.set_chain_mapping("{sc}", "{tc}")\n'
             'print("__MCP_RESULT__" + json.dumps({"success": True, "source_chain": "' + sc + '", "target_chain": "' + tc + '"}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -239,7 +243,7 @@ def register(server):
             "    })\n"
             'print("__MCP_RESULT__" + json.dumps(mappings))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -269,5 +273,5 @@ def register(server):
             f"controller.auto_align_all_bones({enum_val})\n"
             'print("__MCP_RESULT__" + json.dumps({"success": True, "side": "' + source_or_target + '"}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)

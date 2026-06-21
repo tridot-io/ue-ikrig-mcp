@@ -11,6 +11,7 @@ from ..ue_scripts import (
     build_save_asset,
     build_create_ik_rig,
     build_asset_registry_query,
+    safe_execute,
 )
 
 
@@ -56,13 +57,16 @@ def register(server):
                 "controller.set_skeletal_mesh(skm)\n"
                 'print("__MCP_RESULT__" + json.dumps({"set_mesh": True}))'
             )
-            result = conn.execute(script)
+            # safe_execute returns the payload on success, or {"error": True, ...}
+            # on failure — so this create-failure guard now actually fires before we
+            # try to set the mesh on a rig that was never created.
+            result = safe_execute(conn, script)
             if isinstance(result, dict) and result.get("error"):
                 return _ok(result)
-            result2 = conn.execute(set_mesh)
+            result2 = safe_execute(conn, set_mesh)
             return _ok(result2)
 
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -104,7 +108,7 @@ def register(server):
             '    goals.append({"goal_name": str(g.goal_name), "bone_name": str(g.bone_name)})\n'
             'print("__MCP_RESULT__" + json.dumps({"mesh": mesh_path, "root_bone": str(root_bone) if root_bone else None, "chains": chains, "solvers": solvers, "goals": goals}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -131,7 +135,7 @@ def register(server):
             "controller.set_skeletal_mesh(skm)\n"
             'print("__MCP_RESULT__" + json.dumps({"success": True, "rig": ik_rig.get_path_name(), "mesh": skm.get_path_name()}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -155,7 +159,7 @@ def register(server):
             f'controller.set_retarget_root("{bn}")\n'
             'print("__MCP_RESULT__" + json.dumps({"success": True, "root_bone": "' + bn + '"}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -189,7 +193,7 @@ def register(server):
             f'result = controller.add_retarget_chain("{cn}", "{sb}", "{eb}", {goal_arg})\n'
             'print("__MCP_RESULT__" + json.dumps({"success": bool(result), "chain_name": "' + cn + '"}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -213,7 +217,7 @@ def register(server):
             f'result = controller.remove_retarget_chain("{cn}")\n'
             'print("__MCP_RESULT__" + json.dumps({"success": bool(result), "chain_name": "' + cn + '"}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -245,7 +249,7 @@ def register(server):
             "    })\n"
             'print("__MCP_RESULT__" + json.dumps(chains))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -268,7 +272,7 @@ def register(server):
             "bone_names = [str(b) for b in ref_pose.get_bone_names()]\n"
             'print("__MCP_RESULT__" + json.dumps({"bones": bone_names, "count": len(bone_names)}))'
         )
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
 
     @server.tool(
@@ -289,15 +293,18 @@ def register(server):
             "results = {}\n"
             "for class_path in ['/Script/IKRig.IKRigDefinition', '/Script/IKRig.IKRetargeter']:\n"
             "    module, klass = class_path.rsplit('.', 1)\n"
-            "    ar_filter = unreal.ARFilter()\n"
-            "    ar_filter.class_paths = [unreal.TopLevelAssetPath(module, klass)]\n"
-            "    ar_filter.recursive_paths = True\n"
-            + (f'    ar_filter.package_paths = ["{pf}"]\n' if path_filter else "")
+            # UE 5.5+: ARFilter list properties must be passed to the constructor;
+            # attribute assignment raises "cannot be edited on instances".
+            + (
+                f'    ar_filter = unreal.ARFilter(class_paths=[unreal.TopLevelAssetPath(module, klass)], recursive_paths=True, package_paths=["{pf}"])\n'
+                if path_filter else
+                "    ar_filter = unreal.ARFilter(class_paths=[unreal.TopLevelAssetPath(module, klass)], recursive_paths=True)\n"
+            )
             + "    assets = ar.get_assets(ar_filter)\n"
             '    results[klass] = [{"path": str(a.package_name), "name": str(a.asset_name)} for a in assets]\n'
             'print("__MCP_RESULT__" + json.dumps(results))'
         )
-        result = conn.execute(combined_script)
+        result = safe_execute(conn, combined_script)
         return _ok(result)
 
     @server.tool(
@@ -311,5 +318,5 @@ def register(server):
             return _err(str(e))
 
         script = build_save_asset(asset_path)
-        result = conn.execute(script)
+        result = safe_execute(conn, script)
         return _ok(result)
