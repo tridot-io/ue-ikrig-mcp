@@ -34,7 +34,7 @@ def _build_open_asset_script(asset_path: str) -> str:
         "import json as _json\n"
         f'_asset = _ue.load_asset("{p}")\n'
         "if _asset is None:\n"
-        f'    print("__MCP_RESULT__" + _json.dumps({{"error": "asset not found", "asset_path": "{p}"}}))\n'
+        f'    print("__MCP_RESULT__" + _json.dumps({{"error": True, "message": "asset not found", "asset_path": "{p}"}}))\n'
         "else:\n"
         "    _subsystem = _ue.get_editor_subsystem(_ue.AssetEditorSubsystem)\n"
         "    if _subsystem:\n"
@@ -93,10 +93,10 @@ def register(server):
                 text=f"capture_asset_editor: UE script returned no result for {asset_path!r}. Is UE running and the path valid?",
             )]
 
-        if "error" in parsed:
+        if parsed.get("error"):
             return [TextContent(
                 type="text",
-                text=f"capture_asset_editor: {parsed['error']} — asset_path={asset_path!r}",
+                text=f"capture_asset_editor: {parsed.get('message', 'unknown error')} — asset_path={asset_path!r}",
             )]
 
         asset_name: str = parsed.get("name", "")

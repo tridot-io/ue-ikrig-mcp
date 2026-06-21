@@ -37,6 +37,29 @@ def _err(msg: str) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"error": True, "message": msg}, indent=2))]
 
 
+def _load_rig_preamble(need_controller: bool = True) -> str:
+    """Editor-side preamble (H6): load `rig_bp` from the in-editor `rig_path`,
+    assert it is a loadable ControlRigBlueprint, and optionally acquire a non-null
+    RigVMController as `ctrl`. Raises a clear error (surfaced by unwrap) instead of
+    the cryptic `'NoneType' object has no attribute 'get_controller_by_name'` an
+    agent hits today when the asset is missing or the wrong type. Expects the
+    generated script to have already defined the `rig_path` variable."""
+    lines = (
+        "rig_bp = unreal.load_asset(rig_path)\n"
+        "if rig_bp is None:\n"
+        "    raise ValueError('ControlRigBlueprint not loadable: %s' % rig_path)\n"
+        "if type(rig_bp).__name__ != 'ControlRigBlueprint':\n"
+        "    raise ValueError('Asset is not a ControlRigBlueprint (got %s): %s' % (type(rig_bp).__name__, rig_path))\n"
+    )
+    if need_controller:
+        lines += (
+            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
+            "if ctrl is None:\n"
+            "    raise RuntimeError('Could not acquire RigVMController for %s' % rig_path)\n"
+        )
+    return lines
+
+
 def register(server):
     # ------------------------------------------------------------------
     # Lifecycle: create / delete the blueprint asset
@@ -68,9 +91,12 @@ def register(server):
             f'src_path = "{sp}"\n'
             "src = unreal.load_asset(src_path)\n"
             "if src is None:\n"
-            f'    raise ValueError(f"Source asset not loadable: {{src_path}}")\n'
-            "if unreal.EditorAssetLibrary.does_asset_exist(rig_path):\n"
-            "    unreal.EditorAssetLibrary.delete_asset(rig_path)\n"
+            "    raise ValueError('Source asset not loadable: %s' % src_path)\n"
+            # H7: do NOT delete an existing asset up front — a failed create would
+            # then have destroyed the original. Create the new BP first (the factory
+            # places it at a derived path), confirm it exists, and only then delete +
+            # rename over the old one.
+            "existed = unreal.EditorAssetLibrary.does_asset_exist(rig_path)\n"
             "factory = unreal.ControlRigBlueprintFactory()\n"
             "rig_bp = None\n"
             "try:\n"
@@ -80,16 +106,22 @@ def register(server):
             "if rig_bp is None:\n"
             "    target_dir  = rig_path.rsplit('/', 1)[0]\n"
             "    target_name = rig_path.rsplit('/', 1)[1]\n"
+            # create to a temp name when occupied, so the original survives until the new asset is confirmed
+            "    tmp_name = (target_name + '_MCPNew') if existed else target_name\n"
             "    tools = unreal.AssetToolsHelpers.get_asset_tools()\n"
-            "    rig_bp = tools.create_asset(target_name, target_dir, unreal.ControlRigBlueprint, factory)\n"
+            "    rig_bp = tools.create_asset(tmp_name, target_dir, unreal.ControlRigBlueprint, factory)\n"
             "if rig_bp is None:\n"
-            '    raise RuntimeError("Failed to create ControlRigBlueprint")\n'
+            "    raise RuntimeError('Failed to create ControlRigBlueprint (original at %s left intact)' % rig_path)\n"
             "cur = rig_bp.get_path_name().split('.')[0]\n"
             "if cur != rig_path:\n"
+            "    if existed:\n"
+            "        unreal.EditorAssetLibrary.delete_asset(rig_path)\n"
             "    unreal.EditorAssetLibrary.rename_asset(cur, rig_path)\n"
             "    rig_bp = unreal.load_asset(rig_path)\n"
-            "unreal.EditorAssetLibrary.save_asset(rig_path)\n"
-            'print("__MCP_RESULT__" + json.dumps({"rig_path": rig_bp.get_path_name()}))'
+            "if rig_bp is None:\n"
+            "    raise RuntimeError('Rename to %s did not yield a loadable blueprint' % rig_path)\n"
+            "saved = bool(unreal.EditorAssetLibrary.save_asset(rig_path))\n"
+            'print("__MCP_RESULT__" + json.dumps({"rig_path": rig_bp.get_path_name(), "saved": saved, "replaced_existing": existed}))'
         )
         return _ok(safe_execute(conn, script))
 
@@ -156,17 +188,20 @@ def register(server):
             f'tp   = "{tp}"\n'
             f'dv   = "{dv}"\n'
             f'is_in = {inp}\n'
-            "rig_bp = unreal.load_asset(rig_path)\n"
-            "if rig_bp is None:\n"
-            f'    raise ValueError("Rig not loadable: {rp}")\n'
+            + _load_rig_preamble(need_controller=False)
+            + "err = None\n"
             "ok = False\n"
             "try:\n"
             "    rig_bp.add_member_variable(name, tp, is_in, False, dv)\n"
             "    ok = True\n"
             "except Exception as e:\n"
             "    err = str(e)\n"
-            "unreal.EditorAssetLibrary.save_asset(rig_path)\n"
-            'print("__MCP_RESULT__" + json.dumps({"added": ok, "name": name, "cpp_type": tp}))'
+            # H5: do NOT save on failure (was saving unconditionally and dropping
+            # `err`); raise so unwrap surfaces the reason to the caller.
+            "if not ok:\n"
+            '    raise RuntimeError("add_member_variable failed: %s" % err)\n'
+            "saved = bool(unreal.EditorAssetLibrary.save_asset(rig_path))\n"
+            'print("__MCP_RESULT__" + json.dumps({"added": ok, "saved": saved, "name": name, "cpp_type": tp}))'
         )
         return _ok(safe_execute(conn, script))
 
@@ -210,13 +245,8 @@ def register(server):
             f'method_name = "{mn}"\n'
             f'paths = {paths_json}\n'
             f'pos = unreal.Vector2D({float(pos_x)}, {float(pos_y)})\n'
-            "rig_bp = unreal.load_asset(rig_path)\n"
-            "if rig_bp is None:\n"
-            f'    raise ValueError("Rig not loadable: {rp}")\n'
-            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
-            "if ctrl is None:\n"
-            '    raise RuntimeError("Could not acquire RigVMController")\n'
-            "added = None; used_path = None; last_err = None\n"
+            + _load_rig_preamble()
+            + "added = None; used_path = None; last_err = None\n"
             "for p in paths:\n"
             "    try:\n"
             "        n = ctrl.add_unit_node_from_struct_path(p, method_name, pos, node_name)\n"
@@ -291,9 +321,8 @@ def register(server):
             f'type_obj  = "{co}"\n'
             f'node_name = "{nn}"\n'
             f'pos = unreal.Vector2D({float(pos_x)}, {float(pos_y)})\n'
-            "rig_bp = unreal.load_asset(rig_path)\n"
-            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
-            "try:\n"
+            + _load_rig_preamble()
+            + "try:\n"
             "    op = getattr(unreal.RigVMOpCode, op_name)\n"
             "except AttributeError:\n"
             '    raise ValueError(f"Unknown RigVMOpCode: {op_name}. Try dir(unreal.RigVMOpCode) in console.")\n'
@@ -339,9 +368,8 @@ def register(server):
             f'notation = "{tn}"\n'
             f'node_name = "{nn}"\n'
             f'pos = unreal.Vector2D({float(pos_x)}, {float(pos_y)})\n'
-            "rig_bp = unreal.load_asset(rig_path)\n"
-            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
-            "n = ctrl.add_template_node(notation, pos, node_name)\n"
+            + _load_rig_preamble()
+            + "n = ctrl.add_template_node(notation, pos, node_name)\n"
             "if n is None:\n"
             '    raise RuntimeError("add_template_node returned None")\n'
             'print("__MCP_RESULT__" + json.dumps({"node": n.get_node_path(), "template": notation}))'
@@ -387,9 +415,8 @@ def register(server):
             f'node_name = "{nn}"\n'
             f'is_g = {is_g}\n'
             f'pos = unreal.Vector2D({float(pos_x)}, {float(pos_y)})\n'
-            "rig_bp = unreal.load_asset(rig_path)\n"
-            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
-            "n = ctrl.add_variable_node(var_name, cpp_type, None, is_g, '', pos, node_name)\n"
+            + _load_rig_preamble()
+            + "n = ctrl.add_variable_node(var_name, cpp_type, None, is_g, '', pos, node_name)\n"
             "if n is None:\n"
             '    raise RuntimeError("add_variable_node returned None")\n'
             'print("__MCP_RESULT__" + json.dumps({"node": n.get_node_path()}))'
@@ -425,9 +452,8 @@ def register(server):
             f'pin_path = "{pp}"\n'
             f'value = "{vv}"\n'
             f'ra = {ra}\n'
-            "rig_bp = unreal.load_asset(rig_path)\n"
-            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
-            "ok = ctrl.set_pin_default_value(pin_path, value, ra)\n"
+            + _load_rig_preamble()
+            + "ok = ctrl.set_pin_default_value(pin_path, value, ra)\n"
             'print("__MCP_RESULT__" + json.dumps({"set": bool(ok), "pin": pin_path}))'
         )
         return _ok(safe_execute(conn, script))
@@ -457,9 +483,8 @@ def register(server):
             f'rig_path = "{rp}"\n'
             f'fp = "{fp}"\n'
             f'tp = "{tp}"\n'
-            "rig_bp = unreal.load_asset(rig_path)\n"
-            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
-            "ok = ctrl.add_link(fp, tp)\n"
+            + _load_rig_preamble()
+            + "ok = ctrl.add_link(fp, tp)\n"
             'print("__MCP_RESULT__" + json.dumps({"linked": bool(ok), "from": fp, "to": tp}))'
         )
         return _ok(safe_execute(conn, script))
@@ -485,9 +510,8 @@ def register(server):
         script = wrap_script(
             "import unreal\n"
             f'rig_path = "{rp}"\n'
-            "rig_bp = unreal.load_asset(rig_path)\n"
-            "ctrl = rig_bp.get_controller_by_name('RigVMModel') or rig_bp.get_controller()\n"
-            "graph = ctrl.get_graph() if hasattr(ctrl, 'get_graph') else rig_bp.get_rig_vm_graph()\n"
+            + _load_rig_preamble()
+            + "graph = ctrl.get_graph() if hasattr(ctrl, 'get_graph') else rig_bp.get_rig_vm_graph()\n"
             "nodes_out = []\n"
             "links_out = []\n"
             "try:\n"
@@ -521,10 +545,12 @@ def register(server):
             "active UE log during the compile window and returns structured warnings "
             "and errors (category + message) plus the blueprint's post-compile status. "
             "Python stdout alone misses UE_LOG-level diagnostics; the log tail is what "
-            "makes compile failures visible."
+            "makes compile failures visible. timeout_seconds>0 overrides the default "
+            "command timeout for large rigs (a compile holds the single editor command "
+            "slot for its whole duration, so keep it as low as the rig allows)."
         ),
     )
-    async def cr_compile_and_save(rig_path: str) -> list[TextContent]:
+    async def cr_compile_and_save(rig_path: str, timeout_seconds: float = 0.0) -> list[TextContent]:
         try:
             conn = get_connection()
         except UENotRunningError as e:
@@ -554,6 +580,15 @@ def register(server):
             "    unreal.ControlRigBlueprintLibrary.recompile_vm(rig_bp)\n"
             "except Exception as _e:\n"
             "    compile_err = str(_e)\n"
+            # H4/D6: recompile_vm updates only the RigVM, leaving the Blueprint
+            # `status` enum stale (it read null before). Run the BP compile too so
+            # `status`/`status_message` reflect this compile.
+            "try:\n"
+            "    if hasattr(unreal, 'BlueprintEditorLibrary'):\n"
+            "        unreal.BlueprintEditorLibrary.compile_blueprint(rig_bp)\n"
+            "except Exception as _e:\n"
+            "    if compile_err is None:\n"
+            "        compile_err = str(_e)\n"
             # Tail the log for compile-category diagnostics written during the window.
             "warnings_out = []\n"
             "errors_out = []\n"
@@ -576,19 +611,19 @@ def register(server):
             "    except Exception:\n"
             "        pass\n"
             # Post-compile blueprint status — enum name + human-readable summary.
-            "status_name = None\n"
-            "status_message = None\n"
-            "try:\n"
-            "    _s = rig_bp.get_editor_property('status')\n"
-            "    status_name = str(_s).split('.')[-1].split(':')[0].strip() if _s is not None else None\n"
-            "except Exception:\n"
-            "    pass\n"
-            "try:\n"
-            "    status_message = str(rig_bp.get_editor_property('status_message'))\n"
-            "except Exception:\n"
-            "    pass\n"
+            # H4/D6: ControlRigBlueprint exposes no readable 'status' property in UE
+            # 5.x (get_editor_property('status') raises), so it always read null.
+            # Derive a meaningful status from the signals that DO work — the compile
+            # exception and the log-tail diagnostics — instead of a perpetual null.
+            "if compile_err is not None or errors_out:\n"
+            "    status_name = 'ERROR'\n"
+            "elif warnings_out:\n"
+            "    status_name = 'WARNING'\n"
+            "else:\n"
+            "    status_name = 'OK'\n"
+            "status_message = compile_err if compile_err else ('%d error(s), %d warning(s)' % (len(errors_out), len(warnings_out)))\n"
             "saved = bool(unreal.EditorAssetLibrary.save_asset(rig_path))\n"
-            "_success = compile_err is None and not errors_out and (status_name not in ('ERROR', 'BS_ERROR'))\n"
+            "_success = compile_err is None and not errors_out\n"
             'print("__MCP_RESULT__" + json.dumps({'
             '"saved": saved, "compile_error": compile_err, '
             '"status": status_name, "status_message": status_message, '
@@ -597,4 +632,5 @@ def register(server):
             '"success": _success, "log_file": active_log'
             '}))'
         )
-        return _ok(safe_execute(conn, script))
+        _to = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
+        return _ok(safe_execute(conn, script, timeout=_to))

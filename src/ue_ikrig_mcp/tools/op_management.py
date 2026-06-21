@@ -52,6 +52,8 @@ def register(server):
             f'rtg = unreal.load_asset("{rtp}")\n'
             "if rtg is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
+            "if type(rtg).__name__ != 'IKRetargeter':\n"
+            "    raise ValueError('Asset is not an IKRetargeter (got %s): %s' % (type(rtg).__name__, rtg.get_path_name()))\n"
             "ctrl = unreal.IKRetargeterController.get_controller(rtg)\n"
             f"idx = int({int(op_index)})\n"
             "n = ctrl.get_num_retarget_ops()\n"
@@ -93,6 +95,8 @@ def register(server):
             f'rtg = unreal.load_asset("{rtp}")\n'
             "if rtg is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
+            "if type(rtg).__name__ != 'IKRetargeter':\n"
+            "    raise ValueError('Asset is not an IKRetargeter (got %s): %s' % (type(rtg).__name__, rtg.get_path_name()))\n"
             "ctrl = unreal.IKRetargeterController.get_controller(rtg)\n"
             f"query_idx = int({idx_arg})\n"
             "n = ctrl.get_num_retarget_ops()\n"
@@ -146,6 +150,8 @@ def register(server):
             f'rtg = unreal.load_asset("{rtp}")\n'
             "if rtg is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
+            "if type(rtg).__name__ != 'IKRetargeter':\n"
+            "    raise ValueError('Asset is not an IKRetargeter (got %s): %s' % (type(rtg).__name__, rtg.get_path_name()))\n"
             "ctrl = unreal.IKRetargeterController.get_controller(rtg)\n"
             "run_idx = -1\n"
             "for i in range(ctrl.get_num_retarget_ops()):\n"
@@ -196,6 +202,8 @@ def register(server):
             f'rtg = unreal.load_asset("{rtp}")\n'
             "if rtg is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
+            "if type(rtg).__name__ != 'IKRetargeter':\n"
+            "    raise ValueError('Asset is not an IKRetargeter (got %s): %s' % (type(rtg).__name__, rtg.get_path_name()))\n"
             "ctrl = unreal.IKRetargeterController.get_controller(rtg)\n"
             "ss_idx = -1\n"
             "for i in range(ctrl.get_num_retarget_ops()):\n"

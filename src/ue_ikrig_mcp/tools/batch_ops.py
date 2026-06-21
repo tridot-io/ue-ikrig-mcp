@@ -77,12 +77,15 @@ def register(server):
             "  set_current_pose: {op, name, side?}\n"
             "  save: {op}\n"
             "side defaults to 'Target'. Per-op failures are captured and don't "
-            "abort the batch. Returns {count, ok_count, err_count, results}."
+            "abort the batch; a 'save' op is skipped if any earlier op failed. "
+            "timeout_seconds>0 overrides the default command timeout for large "
+            "batches. Returns {count, ok_count, err_count, results}."
         ),
     )
     async def batch_retargeter_ops(
         retargeter_path: str,
         ops: list,
+        timeout_seconds: float = 0.0,
     ) -> list[TextContent]:
         try:
             conn = get_connection()
@@ -101,6 +104,10 @@ def register(server):
             f'rtg = unreal.load_asset("{rtp}")\n'
             "if rtg is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
+            # H6: reject the wrong asset type up front with a clear message instead of
+            # failing opaquely inside get_controller.
+            "if type(rtg).__name__ != 'IKRetargeter':\n"
+            "    raise ValueError('Asset is not an IKRetargeter (got %s): %s' % (type(rtg).__name__, rtg.get_path_name()))\n"
             "ctrl = unreal.IKRetargeterController.get_controller(rtg)\n"
             "if ctrl is None:\n"
             f'    raise ValueError("Could not get controller for: {rtp}")\n'
@@ -183,8 +190,15 @@ def register(server):
             "            ctrl.set_current_retarget_pose(_pn, _sot)\n"
             "            _r['pose'] = _pn\n"
             "        elif _kind == 'save':\n"
-            f'            _saved = bool(ed.save_asset("{rtp}", only_if_is_dirty=False))\n'
-            "            _r['saved'] = _saved\n"
+            # H8: do not persist a partially-failed batch. If any op before this save
+            # errored, skip the save and say why, so the caller doesn't bake a
+            # half-applied edit onto disk.
+            "            if err_count > 0:\n"
+            "                _r['saved'] = False\n"
+            "                _r['skipped'] = 'not saving: %d prior op(s) failed in this batch' % err_count\n"
+            "            else:\n"
+            f'                _saved = bool(ed.save_asset("{rtp}", only_if_is_dirty=False))\n'
+            "                _r['saved'] = _saved\n"
             "        else:\n"
             "            raise ValueError('Unknown op kind: ' + str(_kind))\n"
             "        _r['ok'] = True\n"
@@ -201,7 +215,10 @@ def register(server):
             "    'results': results,\n"
             "}))"
         )
-        result = safe_execute(conn, script)
+        # H10: a large batch holds the single editor command slot for its whole run;
+        # let the caller raise the timeout above the 120s default when needed.
+        _to = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
+        result = safe_execute(conn, script, timeout=_to)
         return _ok(result)
 
     @server.tool(
@@ -211,7 +228,10 @@ def register(server):
             "round-trip. deltas maps bone_name -> [dp, dy, dr]. This is the "
             "delta counterpart of batch_set_bone_rotation_offset (which sets "
             "absolute euler). source_or_target: 'Source' | 'Target' (default "
-            "'Target'). Per-bone errors are captured; the batch continues."
+            "'Target'). Per-bone errors are captured; the batch continues. "
+            "NOTE: deltas are NON-IDEMPOTENT — re-running after a partial failure "
+            "double-applies to the bones that already succeeded. To retry safely, "
+            "prefer the absolute setter batch_set_bone_rotation_offset."
         ),
     )
     async def bulk_adjust_bone_rotation(
@@ -244,7 +264,11 @@ def register(server):
             f'rtg = unreal.load_asset("{rtp}")\n'
             "if rtg is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
+            "if type(rtg).__name__ != 'IKRetargeter':\n"
+            "    raise ValueError('Asset is not an IKRetargeter (got %s): %s' % (type(rtg).__name__, rtg.get_path_name()))\n"
             "ctrl = unreal.IKRetargeterController.get_controller(rtg)\n"
+            "if ctrl is None:\n"
+            f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f"SIDE = unreal.RetargetSourceOrTarget.{side}\n"
             f"_deltas = {deltas_json}\n"
             "def _deg(q):\n"
@@ -312,7 +336,11 @@ def register(server):
             f'rtg = unreal.load_asset("{rtp}")\n'
             "if rtg is None:\n"
             f'    raise ValueError("IKRetargeter not found: {rtp}")\n'
+            "if type(rtg).__name__ != 'IKRetargeter':\n"
+            "    raise ValueError('Asset is not an IKRetargeter (got %s): %s' % (type(rtg).__name__, rtg.get_path_name()))\n"
             "ctrl = unreal.IKRetargeterController.get_controller(rtg)\n"
+            "if ctrl is None:\n"
+            f'    raise ValueError("Could not get controller for: {rtp}")\n'
             f"_cfg = {cfg_json}\n"
             "applied = []\n"
             "for chain, c in _cfg.items():\n"

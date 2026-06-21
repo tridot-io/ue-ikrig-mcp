@@ -234,7 +234,7 @@ def build_asset_describe_script(asset_path: str, asset_name: str, kind: str) -> 
         lines += [
             f'gen = unreal.load_object(None, "{path}.{name}_C")',
             "if gen is not None:",
-            "    info['generated_class'] = gen.get_name()",
+            "    info['generated_class'] = gen.__name__ if isinstance(gen, type) else gen.get_name()",
             "try:",
             "    variables = asset.get_editor_property('new_variables')",
             "    info['variables'] = ["
