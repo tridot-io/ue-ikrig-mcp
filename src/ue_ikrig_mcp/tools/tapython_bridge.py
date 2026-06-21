@@ -136,13 +136,12 @@ def register(server):
     @server.tool(
         name="tapython_create_animbp_node",
         description=(
-            "Add an AnimGraphNode to an Animation Blueprint's AnimGraph. Requires "
-            "the TAPython plugin (`unreal.PythonBPLib.spawn_function_to_graph`). "
-            "Stock UE 5.6 has no Python API for AnimGraph node creation — this is "
-            "the only path short of custom C++. node_class_name example: "
-            "'AnimGraphNode_TwoBoneIK', 'AnimGraphNode_ModifyBone', "
-            "'AnimGraphNode_Fabrik'. graph_name defaults to 'AnimGraph'. Position "
-            "controls the editor placement; pin wiring is not handled here."
+            "Diagnostic stub: AnimGraph node creation via TAPython is NOT available "
+            "headlessly through this MCP. TAPython graph APIs are bound to an "
+            "interactive Chameleon/focused editor graph panel, not arbitrary "
+            "AnimBlueprint assets by path. This tool returns an explicit capability "
+            "error without touching the editor; use tapython_status for diagnostics "
+            "and cr_* only for Control Rig graphs."
         ),
     )
     async def tapython_create_animbp_node(
@@ -246,10 +245,11 @@ def register(server):
     @server.tool(
         name="tapython_dump_animgraph_json",
         description=(
-            "Dump an AnimGraph's node/edge topology as JSON using TAPython's "
-            "`get_graph_panel_nodes`. Useful for diffing graphs across versions "
-            "or serializing as a template. Pair with tapython_apply_animgraph_json "
-            "to recreate on another AnimBP. graph_name defaults to 'AnimGraph'."
+            "Diagnostic stub: AnimGraph topology dump via TAPython is NOT available "
+            "headlessly through this MCP. TAPython graph inspection APIs read an "
+            "interactive Chameleon/focused editor graph panel, not an arbitrary "
+            "AnimBlueprint asset path. This tool returns an explicit capability "
+            "error; use cr_dump_graph only for Control Rig graph inspection."
         ),
     )
     async def tapython_dump_animgraph_json(
@@ -267,9 +267,11 @@ def register(server):
     @server.tool(
         name="tapython_apply_animgraph_json",
         description=(
-            "EXPERIMENTAL. Apply a previously exported AnimGraph JSON onto a "
-            "target AnimBlueprint via TAPython. Creates missing nodes and wires "
-            "pins where possible. Use dry_run=True first to preview operations."
+            "Diagnostic stub: applying/recreating AnimGraph JSON via TAPython is "
+            "NOT available headlessly through this MCP. The required spawn/wiring "
+            "APIs are interactive Chameleon/focused editor graph operations, not "
+            "asset-by-path operations. This tool returns an explicit capability "
+            "error and does not create nodes or wire pins."
         ),
     )
     async def tapython_apply_animgraph_json(

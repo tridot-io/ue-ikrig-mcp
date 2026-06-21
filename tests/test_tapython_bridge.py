@@ -14,10 +14,13 @@ from ue_ikrig_mcp.tools.tapython_bridge import _STATUS_SCRIPT
 class _CaptureServer:
     def __init__(self):
         self.tools = {}
+        self.descriptions = {}
 
     def tool(self, *a, name=None, description=None, **k):
         def deco(fn):
-            self.tools[name or fn.__name__] = fn
+            tool_name = name or fn.__name__
+            self.tools[tool_name] = fn
+            self.descriptions[tool_name] = description or ""
             return fn
         return deco
 
@@ -92,6 +95,29 @@ class TestStatusScriptTargetsRealApis(unittest.TestCase):
         # those live on ChameleonData, so PythonBPLib must not be the probe target
         # for the graph capability.
         self.assertIn("cd is not None and hasattr(cd, 'spawn_function_to_graph')", _STATUS_SCRIPT)
+
+
+class TestToolDescriptionsHonest(unittest.TestCase):
+    def setUp(self):
+        self.server = _build()
+
+    def test_graph_tool_descriptions_do_not_overpromise(self):
+        for name in [
+            "tapython_create_animbp_node",
+            "tapython_dump_animgraph_json",
+            "tapython_apply_animgraph_json",
+        ]:
+            desc = self.server.descriptions[name]
+            self.assertIn("NOT available", desc, name)
+            self.assertIn("headlessly", desc, name)
+            self.assertIn("capability", desc.lower(), name)
+        self.assertNotIn("Creates missing nodes and wires pins", self.server.descriptions["tapython_apply_animgraph_json"])
+        self.assertNotIn("Useful for diffing", self.server.descriptions["tapython_dump_animgraph_json"])
+
+    def test_status_remains_first_diagnostic_description(self):
+        desc = self.server.descriptions["tapython_status"]
+        self.assertIn("Use this before any other tapython_* tool", desc)
+        self.assertIn("NOT available", desc)
 
 
 if __name__ == "__main__":

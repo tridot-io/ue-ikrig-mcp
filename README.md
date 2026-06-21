@@ -115,9 +115,12 @@ ue-ikrig-mcp
 - `list_scripts` / `delete_script` - Manage the store (`UE_MCP_SCRIPT_DIR`, default `~/.ue_ikrig_mcp/scripts`)
 
 ### API catalogue (3)
-- `build_api_catalog` - One-time harvest of the editor's `unreal` Python API (classes/methods/properties with signatures and doc summaries) plus the project's own types from the asset registry (Blueprint/widget/anim-BP classes, user structs/enums, data assets - with parent class and asset path, no asset loading) into a local file keyed by engine version; runs automatically on the first search when the editor is connected, so the explicit call is mainly for `force=true` rebuilds
-- `search_unreal_api` - Instant local BM25 keyword search over the catalogue - no editor round-trip, prevents hallucinated API names; zero-hit queries cascade through UE-synonym, substring, and typo-tolerant passes (`match_mode` reports which); kind filters include `blueprint`, `widget`, `struct`, `enum`, `dataasset`
-- `describe_unreal_api` - Full docstring for one symbol (live from the editor when connected, catalogue otherwise); class responses carry the ancestor chain, and `include_inherited=true` maps each ancestor to the members it contributes (UE members live on the defining class); project Blueprint symbols resolve as assets - parent class, generated class, BP variables (`UE_MCP_CATALOG_DIR`, default `~/.ue_ikrig_mcp/api_catalog`)
+- `build_api_catalog` - One-time harvest of the editor's `unreal` Python API (classes/methods/properties with signatures and doc summaries) plus the project's own types from the asset registry (Blueprint/widget/anim-BP classes, material assets/functions/instances, user structs/enums, data assets - with parent class and asset path, no asset loading) into a local file keyed by engine version; runs automatically on the first search when the editor is connected, so the explicit call is mainly for `force=true` rebuilds
+- `search_unreal_api` - Instant local BM25 keyword search over the catalogue - no editor round-trip, prevents hallucinated API names; zero-hit queries cascade through UE-synonym, substring, and typo-tolerant passes (`match_mode` reports which); kind filters include `blueprint`, `widget`, `animbp`, `material`, `material_function`, `material_instance`, `struct`, `enum`, `dataasset`
+- `describe_unreal_api` - Full docstring for one symbol (live from the editor when connected, catalogue otherwise); class responses carry the ancestor chain, and `include_inherited=true` maps each ancestor to the members it contributes (UE members live on the defining class); project Blueprint/widget/AnimBlueprint/material/material-function/material-instance symbols resolve as assets - parent class, generated class where applicable, BP variables where reflected (`UE_MCP_CATALOG_DIR`, default `~/.ue_ikrig_mcp/api_catalog`)
+
+### Blueprint-family capabilities (1)
+- `blueprint_family_capabilities` - Read-only capability router for Blueprint/K2, WidgetBlueprint, AnimBlueprint, Control Rig, Material/MaterialFunction/MaterialInstance, and TAPython surfaces. Use before graph/node authoring to get support labels, recommended tools, stop conditions, and fixture/verification requirements; it never mutates assets.
 
 ### Capture (3)
 - `capture_viewport` - Level editor viewport screenshot via UE AutomationLibrary (hardened with realtime/repaint forcing)
@@ -225,7 +228,7 @@ UE_MCP_CATALOG_DIR=~/.ue_ikrig_mcp/api_catalog # unreal API catalogue location
 - `ue_python_guide` returns the scripting guide (result protocol, asset-path
   rules, modern vs deprecated APIs, timeout discipline, failure triage); read
   it once per session before generating non-trivial scripts.
-- For graph authoring across Blueprint, WidgetBlueprint, AnimBlueprint, Control Rig, and Material, see `docs/ue_graph_authoring_driver_guideline.md` before assuming node creation or pin-wiring support.
+- For graph authoring across Blueprint, WidgetBlueprint, AnimBlueprint, Control Rig, Material/MaterialFunction/MaterialInstance, and TAPython surfaces, call `blueprint_family_capabilities` first and see `docs/ue_graph_authoring_driver_guideline.md` before assuming node creation or pin-wiring support.
 - `execute_python` auto-connects when no editor connection exists, validates
   script syntax locally before any editor round-trip
   (`UE_SCRIPT_PREFLIGHT=false` to disable), and failed results include a

@@ -26,7 +26,17 @@ _VERSION_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_.+-]")
 # than the unreal module. For these, 'p' holds the parent class (not a
 # containing class) and 's' holds the asset's package path.
 PROJECT_ASSET_KINDS = frozenset(
-    {"blueprint", "widget", "animbp", "struct", "enum", "dataasset"}
+    {
+        "blueprint",
+        "widget",
+        "animbp",
+        "material",
+        "material_function",
+        "material_instance",
+        "struct",
+        "enum",
+        "dataasset",
+    }
 )
 
 # (path, mtime) -> (meta, entries, index) so repeated searches reuse the
@@ -70,8 +80,9 @@ ENGINE_VERSION_SCRIPT = wrap_script(
 
 def build_harvest_script(target_windows_path: str) -> str:
     """Script that walks the unreal module inside the editor, then the asset
-    registry for project-defined types (Blueprints, widgets, user structs and
-    enums, data assets), and writes the catalogue JSON to
+    registry for project-defined types (Blueprints, widgets, AnimBlueprints,
+    material assets/functions/instances, user structs and enums, data assets),
+    and writes the catalogue JSON to
     `target_windows_path` (kept off the result echo: the payload is tens of
     MB)."""
     target = escape_string(target_windows_path)
@@ -141,10 +152,10 @@ def build_harvest_script(target_windows_path: str) -> str:
         "# classes come from registry tags, so no asset is loaded.\n"
         "def _short_cls(value):\n"
         "    s = str(value or '').strip()\n"
-        "    if s.endswith(\"'\"):\n"
+        '    if s.endswith("\'"):\n'
         "        s = s[:-1]\n"
-        "    if \"'\" in s:\n"
-        "        s = s.rsplit(\"'\", 1)[-1]\n"
+        '    if "\'" in s:\n'
+        '        s = s.rsplit("\'", 1)[-1]\n'
         "    for sep in ('.', ':', '/'):\n"
         "        if sep in s:\n"
         "            s = s.rsplit(sep, 1)[-1]\n"
@@ -155,6 +166,9 @@ def build_harvest_script(target_windows_path: str) -> str:
         "    ('/Script/Engine', 'Blueprint', 'blueprint', False),\n"
         "    ('/Script/UMGEditor', 'WidgetBlueprint', 'widget', False),\n"
         "    ('/Script/Engine', 'AnimBlueprint', 'animbp', False),\n"
+        "    ('/Script/Engine', 'Material', 'material', False),\n"
+        "    ('/Script/Engine', 'MaterialFunction', 'material_function', False),\n"
+        "    ('/Script/Engine', 'MaterialInstanceConstant', 'material_instance', False),\n"
         "    ('/Script/Engine', 'UserDefinedStruct', 'struct', False),\n"
         "    ('/Script/Engine', 'UserDefinedEnum', 'enum', False),\n"
         "    ('/Script/Engine', 'DataAsset', 'dataasset', True),\n"
@@ -261,17 +275,17 @@ def _entry_tokens(entry: dict[str, Any]) -> list[str]:
     name = entry.get("n", "")
     tokens: list[str] = []
     name_tokens = _tokens(name)
-    tokens.extend(name_tokens * 3)          # name matches dominate
+    tokens.extend(name_tokens * 3)  # name matches dominate
     tokens.extend(_bigrams(name_tokens) * 2)
     if name:
-        tokens.append(name.lower())         # whole-name exact token
+        tokens.append(name.lower())  # whole-name exact token
     parent_tokens = _tokens(entry.get("p", ""))
     tokens.extend(parent_tokens * 2)
     tokens.extend(_bigrams(parent_tokens))
     tokens.extend(_tokens(entry.get("s", "")) * 2)
     tokens.extend(_tokens(entry.get("d", "")))
     for base in entry.get("b", []) or []:
-        tokens.extend(_tokens(base))    # ancestor names: subclasses match
+        tokens.extend(_tokens(base))  # ancestor names: subclasses match
     return tokens
 
 
@@ -297,8 +311,11 @@ class _Bm25Index:
             df = len(postings)
             idf = math.log(1.0 + (self._n - df + 0.5) / (df + 0.5))
             for doc_id, tf in postings:
-                length_norm = 1.0 - self._B + self._B * (
-                    self._doc_len[doc_id] / self._avg_len if self._avg_len else 1.0
+                length_norm = (
+                    1.0
+                    - self._B
+                    + self._B
+                    * (self._doc_len[doc_id] / self._avg_len if self._avg_len else 1.0)
                 )
                 scores[doc_id] = scores.get(doc_id, 0.0) + idf * (
                     tf * (self._K1 + 1.0) / (tf + self._K1 * length_norm)
@@ -307,7 +324,9 @@ class _Bm25Index:
         return [(score, doc_id) for doc_id, score in ranked[:limit]]
 
 
-def _load_indexed(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], _Bm25Index]:
+def _load_indexed(
+    path: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]], _Bm25Index]:
     mtime = path.stat().st_mtime
     cache_key = (str(path), mtime)
     cached = _INDEX_CACHE.get(cache_key)
@@ -481,12 +500,21 @@ def search_catalog(
             matches = bm25(expanded)
             match_mode = "synonyms"
     if not matches:
-        matches = [_entry_payload(e) for e in _substring_pass(entries, query, kind_filter, limit)]
+        matches = [
+            _entry_payload(e)
+            for e in _substring_pass(entries, query, kind_filter, limit)
+        ]
         match_mode = "substring"
     if not matches:
-        matches = [_entry_payload(e) for e in _fuzzy_pass(entries, query, kind_filter, limit)]
+        matches = [
+            _entry_payload(e) for e in _fuzzy_pass(entries, query, kind_filter, limit)
+        ]
         match_mode = "fuzzy"
-    result: dict[str, Any] = {"catalog": meta, "matches": matches, "match_mode": match_mode}
+    result: dict[str, Any] = {
+        "catalog": meta,
+        "matches": matches,
+        "match_mode": match_mode,
+    }
     if not matches:
         result["match_mode"] = "none"
         result["hint"] = _SEARCH_MISS_HINT
@@ -543,20 +571,25 @@ def describe_from_catalog(
                     inherited.setdefault(parent, []).append(entry.get("n", ""))
             # Nearest ancestor first, mirroring resolution order.
             described["inherited"] = {
-                base: sorted(inherited[base])
-                for base in ancestors
-                if base in inherited
+                base: sorted(inherited[base]) for base in ancestors if base in inherited
             }
     return described
 
 
-def save_catalog_marker(engine_version: str, harvested_at: Optional[float] = None) -> Path:
+def save_catalog_marker(
+    engine_version: str, harvested_at: Optional[float] = None
+) -> Path:
     """Used by tests: write a minimal valid catalogue for an engine version."""
     path = catalog_path_for_version(engine_version)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "engine": engine_version,
-        "harvested_at": harvested_at or time.time(),
-        "entries": [],
-    }), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "engine": engine_version,
+                "harvested_at": harvested_at or time.time(),
+                "entries": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     return path

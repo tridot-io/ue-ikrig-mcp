@@ -129,6 +129,17 @@ print([str(a.package_name) for a in assets])
 - Check existence with `unreal.EditorAssetLibrary.does_asset_exist(path)`
   before destructive operations; save with
   `unreal.EditorAssetLibrary.save_loaded_asset(asset)` after mutating.
+- To verify whether a script dirtied content, query the editor's dirty package
+  lists instead of calling guessed `Package.is_dirty()` helpers:
+
+```python
+dirty_content = unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()
+dirty_maps = unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages()
+dirty_names = [str(pkg.get_name()) for pkg in dirty_content + dirty_maps]
+```
+
+  Use this pattern in disposable mutation fixtures before any save/compile
+  claim.
 """
 
 _SECTIONS["api"] = """\
@@ -153,8 +164,10 @@ _SECTIONS["api"] = """\
   catalogue if a plugin was enabled since the last harvest, and only then
   probe live with dir(unreal).
 - The catalogue also covers **project types**: Blueprint classes, widgets,
-  user structs/enums, data assets (kinds: blueprint, widget, animbp, struct,
-  enum, dataasset). Blueprint classes are assets, never `unreal.*` attributes -
+  AnimBlueprints, material assets/functions/instances, user structs/enums, and
+  data assets (kinds: blueprint, widget, animbp, material, material_function,
+  material_instance, struct, enum, dataasset). Blueprint classes are assets,
+  never `unreal.*` attributes -
   reach one via `load("/Game/.../BP_Foo")` or its generated class
   `unreal.load_object(None, "/Game/.../BP_Foo.BP_Foo_C")`.
   `describe_unreal_api("BP_Foo")` returns parent class, generated class, and
@@ -186,6 +199,13 @@ obj = unreal.load_asset(p); print([n for n in dir(obj) if not n.startswith("_")]
   `obj.set_editor_property(...)` when the attribute is not exposed directly.
   Wrap multi-edit mutations in `with unreal.ScopedEditorTransaction("desc"):`
   so they are undoable and notify the editor once.
+
+- For Blueprint-family graph work, call `blueprint_family_capabilities` before
+  authoring. It returns the supported/partial/unsupported matrix for Blueprint/K2,
+  WidgetBlueprint, AnimBlueprint, Control Rig, Material/MaterialFunction/
+  MaterialInstance, and TAPython capability surfaces. Treat unsupported
+  responses as stop conditions; do not borrow Control Rig or TAPython semantics
+  across families.
 - For Control Rig authoring patterns (RigVM node names, pin paths, struct
   drift), read docs/control_rig_python_patterns.md in this repo first.
 """
@@ -266,13 +286,22 @@ def register(server):
         elif requested in _SECTIONS:
             keys = [requested]
         else:
-            return [TextContent(
-                type="text",
-                text=json.dumps({
-                    "error": True,
-                    "message": f"Unknown topic {topic!r}.",
-                    "topics": list(_TOPICS) + ["all"],
-                }, indent=2),
-            )]
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "error": True,
+                            "message": f"Unknown topic {topic!r}.",
+                            "topics": list(_TOPICS) + ["all"],
+                        },
+                        indent=2,
+                    ),
+                )
+            ]
         header = "# Unreal Python scripting guide (ue-ikrig-mcp)\n\n"
-        return [TextContent(type="text", text=header + "\n".join(_SECTIONS[k] for k in keys))]
+        return [
+            TextContent(
+                type="text", text=header + "\n".join(_SECTIONS[k] for k in keys)
+            )
+        ]

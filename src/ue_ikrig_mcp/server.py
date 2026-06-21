@@ -15,7 +15,7 @@ from .tools import (
     fbik_tuning, phat_diagnostics, bone_diagnostics,
     offset_persistence, retarget_helpers, tapython_bridge,
     fbx_batch, sequencer_export, root_motion_ops, anim_notifies,
-    cr_author, batch_ops, guide, script_store, api_catalog,
+    cr_author, batch_ops, guide, script_store, api_catalog, blueprint_capabilities,
 )
 
 
@@ -52,6 +52,7 @@ def register_all_tools():
     guide.register(server)
     script_store.register(server)
     api_catalog.register(server)
+    blueprint_capabilities.register(server)
 
 
 def main():

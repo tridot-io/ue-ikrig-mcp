@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 import socket
 import tempfile
 import threading
@@ -87,41 +88,49 @@ class ScriptGuidanceTests(unittest.TestCase):
         self.assertIn("Invalid Unreal Python execution mode", result["result"])
 
     def test_failure_hints_classify_unreal_attribute_error(self):
-        result = uc._normalize_command_result({
-            "success": False,
-            "result": "AttributeError: module 'unreal' has no attribute 'EditorLevelLib'",
-            "output": "",
-        })
+        result = uc._normalize_command_result(
+            {
+                "success": False,
+                "result": "AttributeError: module 'unreal' has no attribute 'EditorLevelLib'",
+                "output": "",
+            }
+        )
 
         self.assertTrue(result["hints"])
         self.assertIn("dir(unreal)", result["hints"][0])
 
     def test_failure_hints_classify_bad_asset_path(self):
-        result = uc._normalize_command_result({
-            "success": False,
-            "result": "",
-            "output": "LogPython: Error: ValueError: Asset not found: /Game/Missing",
-        })
+        result = uc._normalize_command_result(
+            {
+                "success": False,
+                "result": "",
+                "output": "LogPython: Error: ValueError: Asset not found: /Game/Missing",
+            }
+        )
 
         self.assertTrue(any("/Game/Folder/Asset" in hint for hint in result["hints"]))
 
     def test_success_without_sentinel_hints_at_result_protocol(self):
-        result = uc._normalize_command_result({
-            "success": True,
-            "result": "None",
-            "output": "hello\n",
-        })
+        result = uc._normalize_command_result(
+            {
+                "success": True,
+                "result": "None",
+                "output": "hello\n",
+            }
+        )
 
         self.assertTrue(result["success"])
         self.assertIsNone(result["parsed"])
         self.assertTrue(any("__MCP_RESULT__" in hint for hint in result["hints"]))
 
     def test_success_with_sentinel_has_no_protocol_hint(self):
-        result = uc._normalize_command_result({
-            "success": True,
-            "result": "None",
-            "output": '__MCP_RESULT__{"ok": true}',
-        })
+        result = uc._normalize_command_result(
+            {
+                "success": True,
+                "result": "None",
+                "output": '__MCP_RESULT__{"ok": true}',
+            }
+        )
 
         self.assertEqual(result["parsed"], {"ok": True})
         self.assertEqual(result["hints"], [])
@@ -135,15 +144,18 @@ class RecvFramingTests(unittest.TestCase):
 
         # JSON document padded to exactly two full buffers: the legacy
         # `len(part) < BUFFER_SIZE` framing would hang until timeout here.
-        document = json.dumps({"version": 1, "magic": "ue_py", "type": "command_result"})
+        document = json.dumps(
+            {"version": 1, "magic": "ue_py", "type": "command_result"}
+        )
         payload = document.ljust(buffer_size * 2).encode("utf-8")
         self.assertEqual(len(payload) % buffer_size, 0)
 
         server_sock, client_sock = socket.socketpair()
         try:
+
             def feed():
                 for start in range(0, len(payload), 1000):
-                    server_sock.sendall(payload[start:start + 1000])
+                    server_sock.sendall(payload[start : start + 1000])
 
             feeder = threading.Thread(target=feed)
             feeder.start()
@@ -208,7 +220,9 @@ class ExecutePythonAutoConnectTests(unittest.TestCase):
         self.assertEqual(payload["classification"], "MULTIPLE_EDITORS_DISCOVERED")
         self.assertIn("Multiple Unreal Editor instances", payload["message"])
         self.assertIn("node_id", payload["next_action"])
-        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"])
+        self.assertEqual(
+            [node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"]
+        )
 
     def _ambiguous_connection(self):
         class MultiNodeConnection(uc.UEConnection):
@@ -226,10 +240,14 @@ class ExecutePythonAutoConnectTests(unittest.TestCase):
                 ]
 
             def _open_command_channel_with_fallback(self, *args, **kwargs):
-                raise AssertionError("ambiguous auto-connect must not open a command channel")
+                raise AssertionError(
+                    "ambiguous auto-connect must not open a command channel"
+                )
 
             def execute(self, code, mode="ExecuteFile", timeout=None):
-                raise AssertionError("execute must not run when auto-connect is ambiguous")
+                raise AssertionError(
+                    "execute must not run when auto-connect is ambiguous"
+                )
 
         return MultiNodeConnection()
 
@@ -291,37 +309,55 @@ class ExecutePythonAutoConnectTests(unittest.TestCase):
                 return False
 
             def connect(self, node_id=None, timeout=5.0):
-                raise uc.UEMultipleEditorsAmbiguousError([
-                    {"node_id": "node-a", "project_name": "A", "_transport": "direct_udp"},
-                    {"node_id": "node-b", "project_name": "B", "_transport": "direct_udp"},
-                ])
+                raise uc.UEMultipleEditorsAmbiguousError(
+                    [
+                        {
+                            "node_id": "node-a",
+                            "project_name": "A",
+                            "_transport": "direct_udp",
+                        },
+                        {
+                            "node_id": "node-b",
+                            "project_name": "B",
+                            "_transport": "direct_udp",
+                        },
+                    ]
+                )
 
             def execute(self, code, mode="ExecuteFile", timeout=None):
-                raise AssertionError("execute must not run when editor selection is ambiguous")
+                raise AssertionError(
+                    "execute must not run when editor selection is ambiguous"
+                )
 
         payload = json.loads(self._run_execute_python(AmbiguousConnection())[0].text)
 
         self.assertTrue(payload["error"])
         self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
         self.assertEqual(payload["classification"], "MULTIPLE_EDITORS_DISCOVERED")
-        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"])
+        self.assertEqual(
+            [node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"]
+        )
         self.assertEqual(
             payload["next_action"],
             "Call connect_to_editor(node_id=<one of nodes[].node_id>).",
         )
-        self.assertFalse(payload["message"].startswith("Auto-connect to Unreal Editor failed"))
+        self.assertFalse(
+            payload["message"].startswith("Auto-connect to Unreal Editor failed")
+        )
 
 
 class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
     """A command may only be re-sent when it provably never reached Unreal."""
 
     def _bad_header_response(self):
-        return json.dumps({
-            "version": 99,
-            "magic": "ue_py",
-            "type": "command_result",
-            "source": "editor",
-        }).encode("utf-8")
+        return json.dumps(
+            {
+                "version": 99,
+                "magic": "ue_py",
+                "type": "command_result",
+                "source": "editor",
+            }
+        ).encode("utf-8")
 
     def test_post_send_failure_on_cached_channel_never_resends(self):
         ns = _exec_editor_protocol_script()
@@ -353,7 +389,9 @@ class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
             AssertionError("must not reopen/retry after a post-send failure")
         )
 
-        result = ns["daemon_execute"]({"node_id": "node-1", "code": "x", "timeout": 1.0})
+        result = ns["daemon_execute"](
+            {"node_id": "node-1", "code": "x", "timeout": 1.0}
+        )
 
         self.assertFalse(result["ok"])
         self.assertEqual(channel.sendall_count, 1)
@@ -390,7 +428,9 @@ class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
             AssertionError("must not reopen/retry after peer-closed-post-send")
         )
 
-        result = ns["daemon_execute"]({"node_id": "node-1", "code": "x", "timeout": 1.0})
+        result = ns["daemon_execute"](
+            {"node_id": "node-1", "code": "x", "timeout": 1.0}
+        )
 
         self.assertFalse(result["ok"])
         self.assertNotIn("delivered", result)  # no retry license for the client
@@ -451,7 +491,9 @@ class DaemonExecuteRetryDisciplineTests(unittest.TestCase):
         ns["CHANNELS"]["node-1"] = DeadChannel()
         ns["open_command_channel"] = lambda payload, node_id: (good, None)
 
-        result = ns["daemon_execute"]({"node_id": "node-1", "code": "x", "timeout": 1.0})
+        result = ns["daemon_execute"](
+            {"node_id": "node-1", "code": "x", "timeout": 1.0}
+        )
 
         self.assertTrue(result["ok"])
         self.assertEqual(good.sendall_count, 1)
@@ -553,13 +595,15 @@ class PreludeInjectionTests(unittest.TestCase):
         self.assertEqual(conn.execute_calls, [])
 
     def test_runtime_failure_gets_line_offset_hint(self):
-        conn = _CapturingConnection(result={
-            "success": False,
-            "result": 'Traceback ... File "<string>", line 22 ...',
-            "output": "",
-            "parsed": None,
-            "hints": [],
-        })
+        conn = _CapturingConnection(
+            result={
+                "success": False,
+                "result": 'Traceback ... File "<string>", line 22 ...',
+                "output": "",
+                "parsed": None,
+                "hints": [],
+            }
+        )
         result = self._run_execute_python(conn, "raise ValueError('boom')")
 
         payload = json.loads(result[0].text)
@@ -581,7 +625,9 @@ class PreludeInjectionTests(unittest.TestCase):
         prelude = script_exec.EXECUTE_PYTHON_PRELUDE.replace("import unreal\n", "")
         exec(prelude, namespace)
 
-        self.assertEqual(namespace["load"]("/Game/Ok/Asset"), {"path": "/Game/Ok/Asset"})
+        self.assertEqual(
+            namespace["load"]("/Game/Ok/Asset"), {"path": "/Game/Ok/Asset"}
+        )
         with self.assertRaisesRegex(ValueError, "/Game/Missing"):
             namespace["load"]("/Game/Missing")
 
@@ -590,18 +636,20 @@ class PreludeInjectionTests(unittest.TestCase):
             namespace["mcp_result"]({"obj": object()})
         line = buffer.getvalue()
         self.assertTrue(line.startswith("__MCP_RESULT__"))
-        json.loads(line[len("__MCP_RESULT__"):])  # str-coerced, parseable
+        json.loads(line[len("__MCP_RESULT__") :])  # str-coerced, parseable
 
 
 class ResultShapingTests(unittest.TestCase):
     def test_compact_drops_raw_echo_when_parsed_present(self):
-        shaped = script_exec.shape_result({
-            "success": True,
-            "result": "None",
-            "output": "x" * 5000 + '__MCP_RESULT__{"ok": true}',
-            "parsed": {"ok": True},
-            "hints": [],
-        })
+        shaped = script_exec.shape_result(
+            {
+                "success": True,
+                "result": "None",
+                "output": "x" * 5000 + '__MCP_RESULT__{"ok": true}',
+                "parsed": {"ok": True},
+                "hints": [],
+            }
+        )
 
         self.assertEqual(shaped["output"], "")
         self.assertEqual(shaped["result"], "")
@@ -610,13 +658,15 @@ class ResultShapingTests(unittest.TestCase):
 
     def test_compact_keeps_output_on_failure(self):
         big = "log spam\n" * 3000  # ~27k chars
-        shaped = script_exec.shape_result({
-            "success": False,
-            "result": "",
-            "output": big + "Traceback: the actual error",
-            "parsed": None,
-            "hints": [],
-        })
+        shaped = script_exec.shape_result(
+            {
+                "success": False,
+                "result": "",
+                "output": big + "Traceback: the actual error",
+                "parsed": None,
+                "hints": [],
+            }
+        )
 
         self.assertLess(len(shaped["output"]), 9000)
         self.assertIn("[truncated", shaped["output"])
@@ -651,7 +701,9 @@ class ScriptStoreTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _call(self, tool, *args, **kwargs):
-        return json.loads(asyncio.run(self.fake_server.tools[tool](*args, **kwargs))[0].text)
+        return json.loads(
+            asyncio.run(self.fake_server.tools[tool](*args, **kwargs))[0].text
+        )
 
     def test_save_list_run_delete_roundtrip(self):
         saved = self._call(
@@ -685,7 +737,8 @@ class ScriptStoreTests(unittest.TestCase):
         # run_script injects ARGS + prelude above the code, so a __future__
         # import would fail at run time with a confusing editor-side error.
         rejected = self._call(
-            "save_script", "future-script",
+            "save_script",
+            "future-script",
             "from __future__ import annotations\nmcp_result({})",
         )
         self.assertTrue(rejected["error"])
@@ -712,24 +765,44 @@ class ScriptStoreTests(unittest.TestCase):
                 return False
 
             def connect(self, node_id=None, timeout=5.0):
-                raise uc.UEMultipleEditorsAmbiguousError([
-                    {"node_id": "node-a", "project_name": "A", "_transport": "direct_udp"},
-                    {"node_id": "node-b", "project_name": "B", "_transport": "direct_udp"},
-                ])
+                raise uc.UEMultipleEditorsAmbiguousError(
+                    [
+                        {
+                            "node_id": "node-a",
+                            "project_name": "A",
+                            "_transport": "direct_udp",
+                        },
+                        {
+                            "node_id": "node-b",
+                            "project_name": "B",
+                            "_transport": "direct_udp",
+                        },
+                    ]
+                )
 
             def execute(self, code, mode="ExecuteFile", timeout=None):
-                raise AssertionError("execute must not run when editor selection is ambiguous")
+                raise AssertionError(
+                    "execute must not run when editor selection is ambiguous"
+                )
 
         fake_server = _FakeServer()
         script_store_tools.register(fake_server, connection=AmbiguousConnection())
-        asyncio.run(fake_server.tools["save_script"]("probe", "mcp_result({'ok': True})"))
+        asyncio.run(
+            fake_server.tools["save_script"]("probe", "mcp_result({'ok': True})")
+        )
 
-        payload = json.loads(asyncio.run(fake_server.tools["run_script"]("probe"))[0].text)
+        payload = json.loads(
+            asyncio.run(fake_server.tools["run_script"]("probe"))[0].text
+        )
 
         self.assertEqual(payload["error_code"], "MULTIPLE_EDITORS_DISCOVERED")
         self.assertEqual(payload["classification"], "MULTIPLE_EDITORS_DISCOVERED")
-        self.assertEqual([node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"])
-        self.assertFalse(payload["message"].startswith("Auto-connect to Unreal Editor failed"))
+        self.assertEqual(
+            [node["node_id"] for node in payload["nodes"]], ["node-a", "node-b"]
+        )
+        self.assertFalse(
+            payload["message"].startswith("Auto-connect to Unreal Editor failed")
+        )
 
 
 class _HarvestSimConn(_CapturingConnection):
@@ -748,11 +821,20 @@ class _HarvestSimConn(_CapturingConnection):
             tmp = api_index.catalog_path_for_version(self._engine)
             tmp = tmp.with_name(f"_harvest_tmp_{tmp.name}")
             tmp.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps({
-                "engine": self._engine, "harvested_at": 1.0,
-                "entries": self._entries,
-            }), encoding="utf-8")
-            return {**base, "parsed": {"count": len(self._entries), "engine": self._engine}}
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "engine": self._engine,
+                        "harvested_at": 1.0,
+                        "entries": self._entries,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                **base,
+                "parsed": {"count": len(self._entries), "engine": self._engine},
+            }
         return {**base, "parsed": {"engine": self._engine}}
 
 
@@ -770,36 +852,104 @@ class ApiCatalogTests(unittest.TestCase):
     def _write_catalog(self):
         path = api_index.catalog_path_for_version(self._ENGINE)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "engine": self._ENGINE,
-            "harvested_at": 1.0,
-            "entries": [
-                {"n": "IKRetargeterController", "p": "", "k": "class",
-                 "s": "Controller for editing IK Retargeter assets", "d": ""},
-                {"n": "set_chain_settings", "p": "IKRetargeterController", "k": "method",
-                 "s": "set_chain_settings(settings, chain) -> bool",
-                 "d": "Set the settings of a retarget chain"},
-                {"n": "get_bone_transform", "p": "SkeletalMeshComponent", "k": "method",
-                 "s": "get_bone_transform(name) -> Transform", "d": "World bone transform"},
-                {"n": "StaticMesh", "p": "", "k": "class",
-                 "s": "A piece of static geometry", "d": ""},
-                # Ancestor-chain depth: members live on the defining class.
-                {"n": "SkeletalMeshComponent", "p": "", "k": "class",
-                 "s": "Renders a skeletal mesh", "d": "",
-                 "b": ["MeshComponent", "SceneComponent", "Object"]},
-                {"n": "set_material", "p": "MeshComponent", "k": "method",
-                 "s": "set_material(index, material)", "d": "Set a material"},
-                {"n": "get_world_location", "p": "SceneComponent", "k": "method",
-                 "s": "get_world_location() -> Vector", "d": ""},
-                # Project layer: 'p' is the parent class, 's' the asset path.
-                {"n": "B_SignUpViewModel", "p": "MVVMViewModelBase", "k": "widget",
-                 "s": "/Game/ViewModels/Home/B_SignUpViewModel",
-                 "d": "widget asset, parent MVVMViewModelBase"},
-                {"n": "BP_Luna", "p": "Actor", "k": "blueprint",
-                 "s": "/Game/MetaHumans/Luna/BP_Luna",
-                 "d": "blueprint asset, parent Actor"},
-            ],
-        }), encoding="utf-8")
+        path.write_text(
+            json.dumps(
+                {
+                    "engine": self._ENGINE,
+                    "harvested_at": 1.0,
+                    "entries": [
+                        {
+                            "n": "IKRetargeterController",
+                            "p": "",
+                            "k": "class",
+                            "s": "Controller for editing IK Retargeter assets",
+                            "d": "",
+                        },
+                        {
+                            "n": "set_chain_settings",
+                            "p": "IKRetargeterController",
+                            "k": "method",
+                            "s": "set_chain_settings(settings, chain) -> bool",
+                            "d": "Set the settings of a retarget chain",
+                        },
+                        {
+                            "n": "get_bone_transform",
+                            "p": "SkeletalMeshComponent",
+                            "k": "method",
+                            "s": "get_bone_transform(name) -> Transform",
+                            "d": "World bone transform",
+                        },
+                        {
+                            "n": "StaticMesh",
+                            "p": "",
+                            "k": "class",
+                            "s": "A piece of static geometry",
+                            "d": "",
+                        },
+                        # Ancestor-chain depth: members live on the defining class.
+                        {
+                            "n": "SkeletalMeshComponent",
+                            "p": "",
+                            "k": "class",
+                            "s": "Renders a skeletal mesh",
+                            "d": "",
+                            "b": ["MeshComponent", "SceneComponent", "Object"],
+                        },
+                        {
+                            "n": "set_material",
+                            "p": "MeshComponent",
+                            "k": "method",
+                            "s": "set_material(index, material)",
+                            "d": "Set a material",
+                        },
+                        {
+                            "n": "get_world_location",
+                            "p": "SceneComponent",
+                            "k": "method",
+                            "s": "get_world_location() -> Vector",
+                            "d": "",
+                        },
+                        # Project layer: 'p' is the parent class, 's' the asset path.
+                        {
+                            "n": "B_SignUpViewModel",
+                            "p": "MVVMViewModelBase",
+                            "k": "widget",
+                            "s": "/Game/ViewModels/Home/B_SignUpViewModel",
+                            "d": "widget asset, parent MVVMViewModelBase",
+                        },
+                        {
+                            "n": "BP_Luna",
+                            "p": "Actor",
+                            "k": "blueprint",
+                            "s": "/Game/MetaHumans/Luna/BP_Luna",
+                            "d": "blueprint asset, parent Actor",
+                        },
+                        {
+                            "n": "M_Toon",
+                            "p": "",
+                            "k": "material",
+                            "s": "/Game/Characters/ToonCharacter/M_Toon",
+                            "d": "material asset",
+                        },
+                        {
+                            "n": "MF_1Layer",
+                            "p": "",
+                            "k": "material_function",
+                            "s": "/Game/Materials/Functions/MF_1Layer",
+                            "d": "material_function asset",
+                        },
+                        {
+                            "n": "MI_Body",
+                            "p": "",
+                            "k": "material_instance",
+                            "s": "/Game/Characters/ToonCharacter/Materials/MI_Body",
+                            "d": "material_instance asset",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
         return path
 
     def _register(self, conn):
@@ -820,22 +970,40 @@ class ApiCatalogTests(unittest.TestCase):
             "IKRetargeterController.set_chain_settings",
         )
 
-        classes_only = self._call(server, "search_unreal_api", "retargeter", kind="class")
+        classes_only = self._call(
+            server, "search_unreal_api", "retargeter", kind="class"
+        )
         self.assertTrue(classes_only["matches"])
         self.assertTrue(all(m["kind"] == "class" for m in classes_only["matches"]))
 
     def test_search_recall_ladder_synonym_substring_fuzzy_and_miss_hint(self):
         path = api_index.catalog_path_for_version(self._ENGINE)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "engine": self._ENGINE, "harvested_at": 1.0,
-            "entries": [
-                {"n": "IKRetargeterController", "p": "", "k": "class",
-                 "s": "Controller for IK Retargeter assets", "d": ""},
-                {"n": "set_actor_rotation", "p": "Actor", "k": "method",
-                 "s": "set_actor_rotation(new_rotation) -> bool", "d": ""},
-            ],
-        }), encoding="utf-8")
+        path.write_text(
+            json.dumps(
+                {
+                    "engine": self._ENGINE,
+                    "harvested_at": 1.0,
+                    "entries": [
+                        {
+                            "n": "IKRetargeterController",
+                            "p": "",
+                            "k": "class",
+                            "s": "Controller for IK Retargeter assets",
+                            "d": "",
+                        },
+                        {
+                            "n": "set_actor_rotation",
+                            "p": "Actor",
+                            "k": "method",
+                            "s": "set_actor_rotation(new_rotation) -> bool",
+                            "d": "",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
         server = self._register(_CapturingConnection())
 
         # BM25 hit reports its mode.
@@ -879,7 +1047,9 @@ class ApiCatalogTests(unittest.TestCase):
         self.assertNotIn("inherited", shallow)
 
         deep = self._call(
-            server, "describe_unreal_api", "SkeletalMeshComponent",
+            server,
+            "describe_unreal_api",
+            "SkeletalMeshComponent",
             include_inherited=True,
         )
         self.assertEqual(deep["inherited"]["MeshComponent"], ["set_material"])
@@ -908,13 +1078,25 @@ class ApiCatalogTests(unittest.TestCase):
             {"n": f"AnimNode{i}", "p": "", "k": "class", "s": "anim node", "d": ""}
             for i in range(100)
         ]
-        entries.append({
-            "n": "ABP_Hero", "p": "AnimInstance", "k": "animbp",
-            "s": "/Game/Characters/Hero/ABP_Hero", "d": "animbp asset, parent AnimInstance",
-        })
-        path.write_text(json.dumps({
-            "engine": self._ENGINE, "harvested_at": 1.0, "entries": entries,
-        }), encoding="utf-8")
+        entries.append(
+            {
+                "n": "ABP_Hero",
+                "p": "AnimInstance",
+                "k": "animbp",
+                "s": "/Game/Characters/Hero/ABP_Hero",
+                "d": "animbp asset, parent AnimInstance",
+            }
+        )
+        path.write_text(
+            json.dumps(
+                {
+                    "engine": self._ENGINE,
+                    "harvested_at": 1.0,
+                    "entries": entries,
+                }
+            ),
+            encoding="utf-8",
+        )
         server = self._register(_CapturingConnection())
 
         found = self._call(server, "search_unreal_api", "anim", limit=5, kind="animbp")
@@ -929,10 +1111,18 @@ class ApiCatalogTests(unittest.TestCase):
         self.assertIn("build_api_catalog", missing["message"])
 
     def test_search_auto_builds_catalog_on_first_miss(self):
-        conn = _HarvestSimConn(self._ENGINE, [
-            {"n": "IKRetargeterController", "p": "", "k": "class",
-             "s": "Controller for IK Retargeter assets", "d": ""},
-        ])
+        conn = _HarvestSimConn(
+            self._ENGINE,
+            [
+                {
+                    "n": "IKRetargeterController",
+                    "p": "",
+                    "k": "class",
+                    "s": "Controller for IK Retargeter assets",
+                    "d": "",
+                },
+            ],
+        )
         server = self._register(conn)
 
         found = self._call(server, "search_unreal_api", "retargeter controller")
@@ -960,10 +1150,18 @@ class ApiCatalogTests(unittest.TestCase):
         self.assertEqual(conn.execute_calls, [])  # no probe, no harvest
 
     def test_describe_auto_builds_catalog_on_first_miss(self):
-        conn = _HarvestSimConn(self._ENGINE, [
-            {"n": "IKRetargeterController", "p": "", "k": "class",
-             "s": "Controller for IK Retargeter assets", "d": ""},
-        ])
+        conn = _HarvestSimConn(
+            self._ENGINE,
+            [
+                {
+                    "n": "IKRetargeterController",
+                    "p": "",
+                    "k": "class",
+                    "s": "Controller for IK Retargeter assets",
+                    "d": "",
+                },
+            ],
+        )
         server = self._register(conn)
 
         described = self._call(server, "describe_unreal_api", "IKRetargeterController")
@@ -971,20 +1169,21 @@ class ApiCatalogTests(unittest.TestCase):
         # The fake's live getattr probe returns no doc, so the response comes
         # from the catalogue that the miss just built.
         self.assertEqual(described["source"], "catalog")
-        self.assertEqual(
-            described["entries"][0]["symbol"], "IKRetargeterController"
-        )
+        self.assertEqual(described["entries"][0]["symbol"], "IKRetargeterController")
 
     def test_harvest_and_version_scripts_compile(self):
         compile(api_index.ENGINE_VERSION_SCRIPT, "<version>", "exec")
         harvest = api_index.build_harvest_script("C:\\temp\\cat.json")
         compile(harvest, "<harvest>", "exec")
         self.assertIn("ARFilter", harvest)  # project-asset pass present
-        self.assertIn("mro", harvest)       # ancestor-chain harvest present
-        for kind in ("blueprint", "struct"):
+        self.assertIn("MaterialFunction", harvest)
+        self.assertIn("MaterialInstanceConstant", harvest)
+        self.assertIn("mro", harvest)  # ancestor-chain harvest present
+        for kind in ("blueprint", "struct", "material", "material_function"):
             compile(
                 api_index.build_asset_describe_script("/Game/X/BP_Foo", "BP_Foo", kind),
-                "<asset-describe>", "exec",
+                "<asset-describe>",
+                "exec",
             )
 
     def test_search_finds_project_blueprints_and_kind_filter(self):
@@ -1001,6 +1200,56 @@ class ApiCatalogTests(unittest.TestCase):
         bp_only = self._call(server, "search_unreal_api", "luna", kind="blueprint")
         self.assertTrue(bp_only["matches"])
         self.assertTrue(all(m["kind"] == "blueprint" for m in bp_only["matches"]))
+
+    def test_search_finds_project_material_asset_kinds(self):
+        self._write_catalog()
+        server = self._register(_CapturingConnection())
+
+        material = self._call(server, "search_unreal_api", "toon", kind="material")
+        self.assertEqual(material["matches"][0]["symbol"], "M_Toon")
+        self.assertEqual(
+            material["matches"][0]["asset_path"],
+            "/Game/Characters/ToonCharacter/M_Toon",
+        )
+
+        material_function = self._call(
+            server,
+            "search_unreal_api",
+            "layer",
+            kind="material_function",
+        )
+        self.assertEqual(material_function["matches"][0]["symbol"], "MF_1Layer")
+        self.assertEqual(
+            material_function["matches"][0]["asset_path"],
+            "/Game/Materials/Functions/MF_1Layer",
+        )
+
+        material_instance = self._call(
+            server,
+            "search_unreal_api",
+            "body",
+            kind="material_instance",
+        )
+        self.assertEqual(material_instance["matches"][0]["symbol"], "MI_Body")
+
+    def test_describe_material_project_entry_uses_catalog_asset_payload(self):
+        self._write_catalog()
+
+        class DisconnectedConn(_CapturingConnection):
+            def is_connected(self):
+                return False
+
+        server = self._register(DisconnectedConn())
+
+        described = self._call(server, "describe_unreal_api", "M_Toon")
+
+        self.assertEqual(described["source"], "catalog")
+        self.assertEqual(described["entries"][0]["symbol"], "M_Toon")
+        self.assertEqual(described["entries"][0]["kind"], "material")
+        self.assertEqual(
+            described["entries"][0]["asset_path"],
+            "/Game/Characters/ToonCharacter/M_Toon",
+        )
 
     def test_describe_blueprint_accepts_generated_class_suffix(self):
         self._write_catalog()
@@ -1028,13 +1277,25 @@ class ApiCatalogTests(unittest.TestCase):
             {"n": "Bar", "p": f"NativeClass{i}", "k": "method", "s": "x.bar()", "d": ""}
             for i in range(70)
         ]
-        entries.append({
-            "n": "Bar", "p": "Actor", "k": "blueprint",
-            "s": "/Game/Stuff/Bar", "d": "blueprint asset, parent Actor",
-        })
-        path.write_text(json.dumps({
-            "engine": self._ENGINE, "harvested_at": 1.0, "entries": entries,
-        }), encoding="utf-8")
+        entries.append(
+            {
+                "n": "Bar",
+                "p": "Actor",
+                "k": "blueprint",
+                "s": "/Game/Stuff/Bar",
+                "d": "blueprint asset, parent Actor",
+            }
+        )
+        path.write_text(
+            json.dumps(
+                {
+                    "engine": self._ENGINE,
+                    "harvested_at": 1.0,
+                    "entries": entries,
+                }
+            ),
+            encoding="utf-8",
+        )
 
         class DisconnectedConn(_CapturingConnection):
             def is_connected(self):
@@ -1061,16 +1322,20 @@ class ApiCatalogTests(unittest.TestCase):
 
     def test_describe_blueprint_live_loads_asset(self):
         self._write_catalog()
-        conn = _CapturingConnection(result={
-            "success": True, "result": "", "output": "",
-            "parsed": {
-                "asset_path": "/Game/ViewModels/Home/B_SignUpViewModel",
-                "asset_class": "WidgetBlueprint",
-                "parent_class": "MVVMViewModelBase",
-                "generated_class": "B_SignUpViewModel_C",
-            },
-            "hints": [],
-        })
+        conn = _CapturingConnection(
+            result={
+                "success": True,
+                "result": "",
+                "output": "",
+                "parsed": {
+                    "asset_path": "/Game/ViewModels/Home/B_SignUpViewModel",
+                    "asset_class": "WidgetBlueprint",
+                    "parent_class": "MVVMViewModelBase",
+                    "generated_class": "B_SignUpViewModel_C",
+                },
+                "hints": [],
+            }
+        )
         server = self._register(conn)
 
         described = self._call(server, "describe_unreal_api", "B_SignUpViewModel")
@@ -1080,22 +1345,29 @@ class ApiCatalogTests(unittest.TestCase):
         self.assertEqual(described["kind"], "widget")
         self.assertEqual(described["generated_class"], "B_SignUpViewModel_C")
         sent_code = conn.execute_calls[0][0]
-        self.assertIn('load_asset("/Game/ViewModels/Home/B_SignUpViewModel")', sent_code)
+        self.assertIn(
+            'load_asset("/Game/ViewModels/Home/B_SignUpViewModel")', sent_code
+        )
         self.assertIn("B_SignUpViewModel_C", sent_code)  # generated-class probe
 
     def test_build_skips_harvest_when_cached(self):
         self._write_catalog()
-        conn = _CapturingConnection(result={
-            "success": True, "result": "", "output": "",
-            "parsed": {"engine": self._ENGINE}, "hints": [],
-        })
+        conn = _CapturingConnection(
+            result={
+                "success": True,
+                "result": "",
+                "output": "",
+                "parsed": {"engine": self._ENGINE},
+                "hints": [],
+            }
+        )
         server = self._register(conn)
 
         built = self._call(server, "build_api_catalog")
 
         self.assertTrue(built["cached"])
         self.assertFalse(built["built"])
-        self.assertEqual(built["entry_count"], 9)
+        self.assertEqual(built["entry_count"], 12)
         # Only the engine-version probe ran; no harvest execution.
         self.assertEqual(len(conn.execute_calls), 1)
 
@@ -1133,6 +1405,30 @@ class GuideToolTests(unittest.TestCase):
         self.assertIn("/Game/Folder/Asset", text)
         self.assertIn("get_editor_subsystem", text)
         self.assertIn("timeout_seconds", text)
+        self.assertIn("blueprint_family_capabilities", text)
+
+    def test_assets_topic_mentions_dirty_package_verification_after_mutations(self):
+        text = asyncio.run(self._register()(topic="assets"))[0].text
+
+        self.assertIn("EditorLoadingAndSavingUtils.get_dirty_content_packages", text)
+        self.assertIn("EditorLoadingAndSavingUtils.get_dirty_map_packages", text)
+        self.assertIn("Package.is_dirty", text)
+        self.assertIn("disposable mutation fixtures", text)
+
+    def test_graph_authoring_guideline_matches_current_material_and_tapython_contract(
+        self,
+    ):
+        text = Path("docs/ue_graph_authoring_driver_guideline.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("material_instance", text)
+        self.assertIn("MaterialInstance", text)
+        self.assertIn("project material assets are now catalog-backed", text)
+        self.assertIn("Unsupported headless authoring", text)
+        self.assertIn("TAPython graph APIs are interactive editor UI", text)
+        self.assertNotIn("not Material", text)
+        self.assertNotIn("Partial / experimental** via TAPython creation", text)
 
     def test_topic_filter_and_unknown_topic(self):
         tool = self._register()
