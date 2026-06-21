@@ -592,6 +592,10 @@ def register(server):
             # Tail the log for compile-category diagnostics written during the window.
             "warnings_out = []\n"
             "errors_out = []\n"
+            # log_read_ok gates the 'OK' verdict: if we could NOT read the log tail,
+            # an absence of errors does NOT prove a clean compile (errors are UE_LOG
+            # lines, not Python exceptions), so we must report UNKNOWN, not OK.
+            "log_read_ok = False\n"
             "_CATS = ('LogControlRig', 'LogRigVM', 'LogBlueprint', 'LogClass', 'LogAsset', 'LogPython', 'LogKismet')\n"
             "if active_log:\n"
             "    try:\n"
@@ -608,8 +612,9 @@ def register(server):
             "                errors_out.append(_line)\n"
             "            elif ': Warning:' in _line:\n"
             "                warnings_out.append(_line)\n"
+            "        log_read_ok = True\n"
             "    except Exception:\n"
-            "        pass\n"
+            "        log_read_ok = False\n"
             # Post-compile blueprint status — enum name + human-readable summary.
             # H4/D6: ControlRigBlueprint exposes no readable 'status' property in UE
             # 5.x (get_editor_property('status') raises), so it always read null.
@@ -619,17 +624,27 @@ def register(server):
             "    status_name = 'ERROR'\n"
             "elif warnings_out:\n"
             "    status_name = 'WARNING'\n"
-            "else:\n"
+            "elif log_read_ok:\n"
             "    status_name = 'OK'\n"
-            "status_message = compile_err if compile_err else ('%d error(s), %d warning(s)' % (len(errors_out), len(warnings_out)))\n"
+            "else:\n"
+            # No Python error and no parsed log lines, but we could not read the log
+            # tail — a UE_LOG compile error would be invisible here, so we cannot
+            # claim OK. Report UNKNOWN and treat success as unconfirmed.
+            "    status_name = 'UNKNOWN'\n"
+            "if compile_err:\n"
+            "    status_message = compile_err\n"
+            "elif not log_read_ok:\n"
+            "    status_message = 'compile log tail unavailable - clean status NOT confirmed (%d error(s), %d warning(s) seen)' % (len(errors_out), len(warnings_out))\n"
+            "else:\n"
+            "    status_message = '%d error(s), %d warning(s)' % (len(errors_out), len(warnings_out))\n"
             "saved = bool(unreal.EditorAssetLibrary.save_asset(rig_path))\n"
-            "_success = compile_err is None and not errors_out\n"
+            "_success = compile_err is None and not errors_out and log_read_ok\n"
             'print("__MCP_RESULT__" + json.dumps({'
             '"saved": saved, "compile_error": compile_err, '
             '"status": status_name, "status_message": status_message, '
             '"errors": errors_out, "warnings": warnings_out, '
             '"error_count": len(errors_out), "warning_count": len(warnings_out), '
-            '"success": _success, "log_file": active_log'
+            '"success": _success, "log_tail_available": log_read_ok, "log_file": active_log'
             '}))'
         )
         _to = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
